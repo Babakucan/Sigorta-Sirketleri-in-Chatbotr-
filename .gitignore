@@ -1,0 +1,21 @@
+# Bağımlılıklar
+node_modules/
+admin-app/node_modules/
+
+# Ortam ve gizlilik (arkadaşın kendi .env dosyasını oluşturur)
+.env
+.env.local
+.env.*.local
+
+# Yüklenen dosyalar ve veritabanı (yerel veri)
+uploads/
+data/*.db
+data/*.db-journal
+
+# Build çıktıları
+admin-app/dist/
+
+# Log ve geçici
+*.log
+.DS_Store
+Thumbs.db
