@@ -43,6 +43,7 @@ type Lead = {
   model?: string | null
   km?: string | null
   ruhsatSeriNo?: string | null
+  aramaTercihi?: string | null
 }
 
 type Conversation = {
@@ -77,6 +78,7 @@ const STATUS_LABELS: Record<string, string> = {
   awaiting_package: 'Paket seçimi bekleniyor',
   fiyat_bekleniyor: 'Fiyat Bekleniyor',
   teklif_gonderildi: 'Teklif Gönderildi',
+  arama_bekliyor: 'Aranma Bekleniyor',
   completed: 'Tamamlandı',
 }
 
@@ -223,7 +225,27 @@ function useApi(token: string | null) {
     return res.json()
   }, [token])
 
-  return { fetchLeads, fetchConversations, fetchPackages, savePackages, createPackage, sendLeadQuote, getLeadPhotoUrl, reparseRuhsat, updateLead }
+  type Settings = { mesai_baslangic: string; mesai_bitis: string; mesai_gunler: string }
+  const fetchSettings = useCallback(async (): Promise<Settings> => {
+    if (!token) throw new Error('Unauthorized')
+    const res = await fetch(`${API_BASE}/api/settings`, { headers: headers() })
+    if (res.status === 401) throw new Error('SESSION_EXPIRED')
+    if (!res.ok) throw new Error('Ayarlar alınamadı')
+    return res.json()
+  }, [token])
+  const saveSettings = useCallback(async (s: Partial<Settings>): Promise<Settings> => {
+    if (!token) throw new Error('Unauthorized')
+    const res = await fetch(`${API_BASE}/api/settings`, {
+      method: 'PUT',
+      headers: { ...headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(s),
+    })
+    if (res.status === 401) throw new Error('SESSION_EXPIRED')
+    if (!res.ok) throw new Error('Ayarlar kaydedilemedi')
+    return res.json()
+  }, [token])
+
+  return { fetchLeads, fetchConversations, fetchPackages, savePackages, createPackage, sendLeadQuote, getLeadPhotoUrl, reparseRuhsat, updateLead, fetchSettings, saveSettings }
 }
 
 function LeadDetailModal({
@@ -311,6 +333,9 @@ function LeadDetailModal({
               <dt>Kullanım</dt><dd>{lead.ruhsatData?.kullanimTarzi ?? lead.ruhsatData?.kullanimAmaci ?? '—'}</dd>
               <dt>Paket</dt><dd>{lead.packageChoice ?? '—'}</dd>
               <dt>Durum</dt><dd>{STATUS_LABELS[lead.status] ?? lead.status}</dd>
+              {lead.status === 'arama_bekliyor' && lead.aramaTercihi && (
+                <><dt>Arama tercihi</dt><dd>{lead.aramaTercihi}</dd></>
+              )}
               <dt>Tarih</dt><dd>{formatDate(lead.createdAt)}</dd>
               {lead.ruhsatData?.sasiNo && <><dt>Şasi (VIN)</dt><dd><code>{lead.ruhsatData.sasiNo}</code></dd></>}
               {lead.ruhsatData?.motorNo && <><dt>Motor no</dt><dd><code>{lead.ruhsatData.motorNo}</code></dd></>}
@@ -629,7 +654,7 @@ function PackagesView({
 }
 
 function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogout: () => void; theme: 'light' | 'dark'; setTheme: (t: 'light' | 'dark') => void }) {
-  const { fetchLeads, fetchConversations, fetchPackages, savePackages, sendLeadQuote, getLeadPhotoUrl, reparseRuhsat } = useApi(token)
+  const { fetchLeads, fetchConversations, fetchPackages, savePackages, sendLeadQuote, getLeadPhotoUrl, reparseRuhsat, fetchSettings, saveSettings } = useApi(token)
   const [leads, setLeads] = useState<Lead[]>([])
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [packages, setPackages] = useState<Package[]>([])
@@ -639,7 +664,7 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
   const [packagesLoadError, setPackagesLoadError] = useState('')
   const [packagesSaveError, setPackagesSaveError] = useState('')
   const [savingPackages, setSavingPackages] = useState(false)
-  const [tab, setTab] = useState<'leads' | 'conversations' | 'packages'>('leads')
+  const [tab, setTab] = useState<'leads' | 'conversations' | 'packages' | 'settings'>('leads')
   const [conversationChatId, setConversationChatId] = useState<string | null>(null)
   const [detailLead, setDetailLead] = useState<Lead | null>(null)
   const [quotePrice, setQuotePrice] = useState<string>('')
@@ -650,6 +675,12 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
   const [leadDateFrom, setLeadDateFrom] = useState('')
   const [leadDateTo, setLeadDateTo] = useState('')
   const [leadSearch, setLeadSearch] = useState('')
+  const [mesaiBaslangic, setMesaiBaslangic] = useState('09:00')
+  const [mesaiBitis, setMesaiBitis] = useState('18:00')
+  const [mesaiGunler, setMesaiGunler] = useState<number[]>([1, 2, 3, 4, 5])
+  const [settingsLoading, setSettingsLoading] = useState(false)
+  const [settingsSaveError, setSettingsSaveError] = useState('')
+  const [settingsSaveSuccess, setSettingsSaveSuccess] = useState(false)
 
   const filteredLeads = useMemo(() => {
     let list = leads
@@ -808,6 +839,21 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
     load()
   }, [load])
 
+  useEffect(() => {
+    if (tab !== 'settings') return
+    setSettingsLoading(true)
+    setSettingsSaveError('')
+    fetchSettings()
+      .then((s) => {
+        setMesaiBaslangic(s.mesai_baslangic || '09:00')
+        setMesaiBitis(s.mesai_bitis || '18:00')
+        const days = (s.mesai_gunler || '1,2,3,4,5').split(',').map((d) => parseInt(d.trim(), 10)).filter((n) => !isNaN(n) && n >= 0 && n <= 6)
+        setMesaiGunler(days.length ? days : [1, 2, 3, 4, 5])
+      })
+      .catch(() => setSettingsSaveError('Ayarlar yüklenemedi'))
+      .finally(() => setSettingsLoading(false))
+  }, [tab, fetchSettings])
+
   return (
     <div className="dashboard">
       <header>
@@ -823,6 +869,7 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
         <button type="button" className={tab === 'leads' ? 'active' : ''} onClick={() => setTab('leads')}>Teklifler ({leads.length})</button>
         <button type="button" className={tab === 'conversations' ? 'active' : ''} onClick={() => setTab('conversations')}>Konuşmalar</button>
         <button type="button" className={tab === 'packages' ? 'active' : ''} onClick={() => setTab('packages')}>Paket fiyatları</button>
+        <button type="button" className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}>Ayarlar</button>
       </nav>
       {loading ? (
         <p>Yükleniyor…</p>
@@ -899,7 +946,7 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
                             <span className="lead-card-plaka">{plaka}</span>
                             <span className="lead-card-date" title={formatDate(row.createdAt)}>{formatRelativeTime(row.createdAt)}</span>
                           </div>
-                          <span className={`lead-card-status ${row.status === 'fiyat_bekleniyor' ? 'lead-card-status-warning' : ''}`}>
+                          <span className={`lead-card-status ${row.status === 'fiyat_bekleniyor' || row.status === 'arama_bekliyor' ? 'lead-card-status-warning' : ''}`}>
                             {statusLabel}
                           </span>
                         </div>
@@ -910,6 +957,9 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
                           <div><dt>KM</dt><dd>{row.km ?? '—'}</dd></div>
                           <div><dt>Tescil Sıra No</dt><dd>{row.ruhsatSeriNo ?? row.ruhsatData?.ruhsatSeriNo ?? '—'}</dd></div>
                           <div><dt>Belge Seri No</dt><dd>{row.ruhsatData?.belgeSeriNo ?? '—'}</dd></div>
+                          {row.status === 'arama_bekliyor' && row.aramaTercihi && (
+                            <div><dt>Arama tercihi</dt><dd>{row.aramaTercihi}</dd></div>
+                          )}
                         </dl>
                         <div className="lead-card-actions">
                           <button type="button" className="lead-btn lead-btn-primary" onClick={() => { setDetailLead(row); setQuotePrice(row.offeredPrice != null ? String(row.offeredPrice) : ''); setQuoteError(''); }}>
@@ -929,6 +979,74 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
         </div>
       ) : tab === 'conversations' ? (
         <ConversationsView conversations={conversations} formatDate={formatDate} initialChatId={conversationChatId} />
+      ) : tab === 'settings' ? (
+        <div className="settings-view">
+          <h2>Mesai saatleri</h2>
+          <p className="settings-desc">Müşteri “Evet, arasın” dediğinde mesai dışındaysa tahmini arama süresi bu saatlere göre hesaplanır.</p>
+          {settingsLoading ? (
+            <p>Yükleniyor…</p>
+          ) : (
+            <form
+              className="settings-form"
+              onSubmit={async (e) => {
+                e.preventDefault()
+                setSettingsSaveError('')
+                setSettingsSaveSuccess(false)
+                try {
+                  await saveSettings({
+                    mesai_baslangic: mesaiBaslangic,
+                    mesai_bitis: mesaiBitis,
+                    mesai_gunler: mesaiGunler.sort((a, b) => a - b).join(','),
+                  })
+                  setSettingsSaveSuccess(true)
+                  setTimeout(() => setSettingsSaveSuccess(false), 3000)
+                } catch (err) {
+                  setSettingsSaveError(err instanceof Error ? err.message : 'Kaydedilemedi')
+                }
+              }}
+            >
+              <div className="settings-row">
+                <label>
+                  <span>Başlangıç</span>
+                  <input type="time" value={mesaiBaslangic} onChange={(e) => setMesaiBaslangic(e.target.value)} />
+                </label>
+                <label>
+                  <span>Bitiş</span>
+                  <input type="time" value={mesaiBitis} onChange={(e) => setMesaiBitis(e.target.value)} />
+                </label>
+              </div>
+              <div className="settings-row">
+                <span className="settings-label">Mesai günleri</span>
+                <div className="settings-days">
+                  {[
+                    { v: 0, label: 'Paz' },
+                    { v: 1, label: 'Pzt' },
+                    { v: 2, label: 'Sal' },
+                    { v: 3, label: 'Çar' },
+                    { v: 4, label: 'Per' },
+                    { v: 5, label: 'Cum' },
+                    { v: 6, label: 'Cmt' },
+                  ].map(({ v, label }) => (
+                    <label key={v} className="settings-day">
+                      <input
+                        type="checkbox"
+                        checked={mesaiGunler.includes(v)}
+                        onChange={(e) => {
+                          if (e.target.checked) setMesaiGunler((prev) => [...prev, v].sort((a, b) => a - b))
+                          else setMesaiGunler((prev) => prev.filter((d) => d !== v))
+                        }}
+                      />
+                      <span>{label}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+              {settingsSaveError && <p className="error">{settingsSaveError}</p>}
+              {settingsSaveSuccess && <p className="success">Ayarlar kaydedildi.</p>}
+              <button type="submit" className="lead-btn lead-btn-primary">Kaydet</button>
+            </form>
+          )}
+        </div>
       ) : (
         <PackagesView
           packages={packages}

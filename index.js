@@ -7,7 +7,7 @@ if (OPENAI_API_KEY) console.log("OPENAI_API_KEY: yüklendi (ruhsat AI aktif)");
 
 const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
-const { getLeads, getLeadById, insertLead, updateLead, getConversations, addConversation, getPackages, updatePackage, insertPackage } = require("./db");
+const { getLeads, getLeadById, insertLead, updateLead, getConversations, addConversation, getPackages, updatePackage, insertPackage, getSetting, setSetting } = require("./db");
 
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) {
@@ -87,8 +87,63 @@ const STATUS_LABELS = {
   awaiting_package: "Paket seçimi bekleniyor",
   fiyat_bekleniyor: "Fiyat Bekleniyor",
   teklif_gonderildi: "Teklif Gönderildi",
+  arama_bekliyor: "Aranma Bekleniyor",
   completed: "Tamamlandı",
 };
+
+function getMesaiSettings() {
+  const start = getSetting("mesai_baslangic") || "09:00";
+  const end = getSetting("mesai_bitis") || "18:00";
+  const daysStr = getSetting("mesai_gunler") || "1,2,3,4,5";
+  const days = daysStr.split(",").map((d) => parseInt(d.trim(), 10)).filter((n) => !isNaN(n) && n >= 0 && n <= 6);
+  return { start, end, days: days.length ? days : [1, 2, 3, 4, 5] };
+}
+
+function parseTime(str) {
+  const m = String(str).match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  if (h < 0 || h > 23 || min < 0 || min > 59) return null;
+  return h * 60 + min;
+}
+
+function isWithinMesai(now) {
+  const d = now instanceof Date ? now : new Date(now);
+  const day = d.getDay();
+  const mins = d.getHours() * 60 + d.getMinutes();
+  const { start, end, days } = getMesaiSettings();
+  if (!days.includes(day)) return false;
+  const startMins = parseTime(start);
+  const endMins = parseTime(end);
+  if (startMins == null || endMins == null) return true;
+  return mins >= startMins && mins < endMins;
+}
+
+function getTahminiAramaSuresi(now) {
+  const d = now instanceof Date ? now : new Date(now);
+  const { start, end, days } = getMesaiSettings();
+  const startMins = parseTime(start);
+  const endMins = parseTime(end);
+  const day = d.getDay();
+  const mins = d.getHours() * 60 + d.getMinutes();
+  for (let ahead = 0; ahead <= 7; ahead++) {
+    const next = new Date(d);
+    next.setDate(next.getDate() + ahead);
+    const nextDay = next.getDay();
+    if (!days.includes(nextDay)) continue;
+    if (ahead === 0 && mins < (startMins ?? 0)) {
+      const h = Math.floor((startMins ?? 0) / 60), m = (startMins ?? 0) % 60;
+      return `Bugün ${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")} sonrası`;
+    }
+    if (ahead === 0 && mins >= (endMins ?? 24 * 60)) continue;
+    if (ahead === 0) return "Yarın mesai başlangıcından itibaren";
+    const dayNames = ["Pazar", "Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi"];
+    const h = Math.floor((startMins ?? 0) / 60), m = (startMins ?? 0) % 60;
+    return `${dayNames[nextDay]} ${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")} sonrası`;
+  }
+  return "Mesai saatleri içinde";
+}
 
 app.get("/ping", (req, res) => {
   res.send("OK");
@@ -163,6 +218,26 @@ app.put("/api/packages", apiAuth, (req, res) => {
   res.json(getPackages());
 });
 
+app.get("/api/settings", apiAuth, (req, res) => {
+  res.json({
+    mesai_baslangic: getSetting("mesai_baslangic") || "09:00",
+    mesai_bitis: getSetting("mesai_bitis") || "18:00",
+    mesai_gunler: getSetting("mesai_gunler") || "1,2,3,4,5",
+  });
+});
+
+app.put("/api/settings", apiAuth, (req, res) => {
+  const { mesai_baslangic, mesai_bitis, mesai_gunler } = req.body || {};
+  if (mesai_baslangic !== undefined) setSetting("mesai_baslangic", mesai_baslangic);
+  if (mesai_bitis !== undefined) setSetting("mesai_bitis", mesai_bitis);
+  if (mesai_gunler !== undefined) setSetting("mesai_gunler", mesai_gunler);
+  res.json({
+    mesai_baslangic: getSetting("mesai_baslangic") || "09:00",
+    mesai_bitis: getSetting("mesai_bitis") || "18:00",
+    mesai_gunler: getSetting("mesai_gunler") || "1,2,3,4,5",
+  });
+});
+
 app.post("/api/leads/:id/send-quote", apiAuth, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const { price } = req.body || {};
@@ -176,9 +251,15 @@ app.post("/api/leads/:id/send-quote", apiAuth, async (req, res) => {
   const pkgName = lead.packageChoice || "seçtiğiniz paket";
   const msg =
     `Harika haber! Seçtiğiniz ${pkgName} için en uygun teklifimiz hazır: ${Math.round(amount).toLocaleString("tr-TR")} TL. ` +
-    "Bu teklif 20 farklı şirketten taranarak en iyi fiyat olarak belirlenmiştir. Onaylıyor musunuz?";
+    "Bu teklif 20 farklı şirketten taranarak en iyi fiyat olarak belirlenmiştir.";
+  const replyMarkup = {
+    inline_keyboard: [
+      [{ text: "Evet", callback_data: "arama_evet_" + id }, { text: "Hayır", callback_data: "arama_hayir_" + id }],
+    ],
+  };
   try {
     await req.app.locals.bot.telegram.sendMessage(lead.chatId, msg);
+    await req.app.locals.bot.telegram.sendMessage(lead.chatId, "Müşteri temsilcimiz sizi arasın mı?", { reply_markup: replyMarkup });
   } catch (err) {
     console.error("Send quote Telegram error:", err.message);
     return res.status(500).json({ error: "Müşteriye mesaj gönderilemedi: " + err.message });
@@ -391,6 +472,49 @@ const MENU_TEXT =
 
    await ctx.answerCbQuery();
 
+   if (data.startsWith("arama_evet_")) {
+     const leadId = parseInt(data.replace("arama_evet_", ""), 10);
+     const lead = leadId ? getLeadById(leadId) : null;
+     if (lead && lead.chatId === chatId) {
+       const zamanKeyboard = Markup.inlineKeyboard([
+         [Markup.button.callback("Hemen", "arama_zaman_hemen_" + leadId)],
+         [Markup.button.callback("Bugün mesai içinde", "arama_zaman_bugun_" + leadId)],
+         [Markup.button.callback("Yarın", "arama_zaman_yarin_" + leadId)],
+         [Markup.button.callback("İleride belirteceğim", "arama_zaman_ileride_" + leadId)],
+       ]);
+       await ctx.telegram.sendMessage(chatId, "Sizi ne zaman aramamızı istersiniz?", zamanKeyboard);
+     }
+     return;
+   }
+   if (data.startsWith("arama_zaman_")) {
+     const rest = data.replace("arama_zaman_", "");
+     const lastUnderscore = rest.lastIndexOf("_");
+     const choice = lastUnderscore >= 0 ? rest.slice(0, lastUnderscore) : rest;
+     const leadId = parseInt(lastUnderscore >= 0 ? rest.slice(lastUnderscore + 1) : "", 10);
+     const lead = leadId ? getLeadById(leadId) : null;
+     if (lead && lead.chatId === chatId) {
+       const choiceLabels = { hemen: "Hemen", bugun: "Bugün mesai içinde", yarin: "Yarın", ileride: "İleride belirteceğim" };
+       const label = choiceLabels[choice] || choice;
+       const now = new Date();
+       let confirmMsg = `Tercihiniz (${label}) kaydedildi. `;
+       if (choice === "hemen" && isWithinMesai(now)) {
+         confirmMsg += "Müşteri temsilcimiz kısa süre içinde sizi arayacak.";
+       } else if (choice === "hemen" || choice === "bugun") {
+         const tahmini = getTahminiAramaSuresi(now);
+         confirmMsg += "Müşteri temsilcimiz mesai saatleri içinde sizi arayacak. Tahmini süre: " + tahmini;
+       } else {
+         confirmMsg += "Müşteri temsilcimiz belirttiğiniz zaman diliminde sizi arayacak.";
+       }
+       await ctx.telegram.sendMessage(chatId, confirmMsg);
+       updateLead(lead.id, { status: "arama_bekliyor", aramaTercihi: label });
+     }
+     return;
+   }
+   if (data.startsWith("arama_hayir_")) {
+     await ctx.telegram.sendMessage(chatId, "Tamam, ihtiyacınız olursa bize ulaşabilirsiniz.");
+     return;
+   }
+
    if (data === "menu_1") {
      addMessage(chatId, "user", "[Menü: Yeni Teklif]");
      const lead = createLead({ chatId, status: "awaiting_name" });
@@ -447,15 +571,15 @@ const MENU_TEXT =
      const lead = state?.leadId ? findLeadById(state.leadId) : null;
      if (!lead) return;
 
-     if (data === "pkg_detay") {
-       const pkgs = getPackages();
-       const reply =
-         pkgs.map((p) => `${p.name}: ${p.description}`).join("\n\n") +
-         "\n\nHangi kapsamda koruma istersiniz? Aşağıdaki butonlardan seçin.";
-       addMessage(chatId, "bot", reply);
-       await ctx.telegram.sendMessage(chatId, reply, packageInlineKeyboard());
-       return;
-     }
+    if (data === "pkg_detay") {
+      const pkgs = getPackages();
+      const reply =
+        pkgs.map((p) => `${p.name}: ${p.description}`).join("\n\n") +
+        "\n\nHangi kapsamda koruma istersiniz? Aşağıdaki butonlardan seçin.";
+      addMessage(chatId, "bot", reply);
+      await ctx.telegram.sendMessage(chatId, reply, packageInlineKeyboard(false));
+      return;
+    }
      if (data === "pkg_ara") {
        lead.packageChoice = "Beni Ara";
        lead.status = "completed";
@@ -864,15 +988,15 @@ bot.on("text", async (ctx) => {
         }
       }
 
-      const updates = { markaKm: markaKm || (lead.markaKm || ""), status: "fiyat_bekleniyor" };
+      const updates = { markaKm: markaKm || (lead.markaKm || ""), status: "awaiting_package" };
       if (marka) updates.marka = marka;
       if (km) updates.km = km;
       updateLead(lead.id, updates);
-      setChatState(chatId, null);
+      setChatState(chatId, { mode: "awaiting_package", leadId: lead.id });
       const reply =
-        "Bilgileriniz alındı. Teklifiniz hazırlanacak; en kısa sürede size dönüş yapacağız.";
+        "Bilgileriniz alındı. Hangi sigorta paketini tercih ediyorsunuz? Aşağıdaki butonlardan seçin.";
       addMessage(chatId, "bot", reply);
-      await ctx.reply(reply);
+      await ctx.reply(reply, packageInlineKeyboard());
       return;
     }
   }
@@ -931,13 +1055,11 @@ bot.on("text", async (ctx) => {
   await ctx.reply(reply, menuInlineKeyboard());
 });
 
-function packageInlineKeyboard() {
+/** includeDetay: true = ilk sefer (Detay butonu var), false = Detay tıklandıktan sonra (sadece paketler). Beni Ara hiç gösterilmez. */
+function packageInlineKeyboard(includeDetay = true) {
   const packages = getPackages();
   const rows = packages.map((p) => [Markup.button.callback(p.name, p.key)]);
-  rows.push([
-    Markup.button.callback("Detay", "pkg_detay"),
-    Markup.button.callback("Beni Ara", "pkg_ara"),
-  ]);
+  if (includeDetay) rows.push([Markup.button.callback("Detay", "pkg_detay")]);
   return Markup.inlineKeyboard(rows);
 }
 

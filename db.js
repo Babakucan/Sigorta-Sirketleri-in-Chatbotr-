@@ -47,6 +47,11 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_leads_created ON leads(created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_conversations_chat ON conversations(chat_id);
   CREATE INDEX IF NOT EXISTS idx_conversations_ts ON conversations(timestamp DESC);
+
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  );
 `);
 
 try { db.exec("ALTER TABLE leads ADD COLUMN offered_price REAL"); } catch (_) {}
@@ -58,6 +63,7 @@ try { db.exec("ALTER TABLE leads ADD COLUMN marka TEXT"); } catch (_) {}
 try { db.exec("ALTER TABLE leads ADD COLUMN model TEXT"); } catch (_) {}
 try { db.exec("ALTER TABLE leads ADD COLUMN km TEXT"); } catch (_) {}
 try { db.exec("ALTER TABLE leads ADD COLUMN ruhsat_seri_no TEXT"); } catch (_) {}
+try { db.exec("ALTER TABLE leads ADD COLUMN arama_tercihi TEXT"); } catch (_) {}
 
 const defaultPackages = [
   { key: "pkg_eko", name: "Ekonomik", description: "Çarpışma, yangın, hırsızlık. Temel kapsam.", label: "Ekonomik kapsam", price: 0, discount_percent: 0, sort_order: 1 },
@@ -71,6 +77,26 @@ if (existing.c === 0) {
 } else {
   const upd = db.prepare("UPDATE packages SET name = ?, description = ?, label = ? WHERE key = ?");
   defaultPackages.forEach((p) => upd.run(p.name, p.description, p.label || null, p.key));
+}
+
+const defaultSettings = [
+  { key: "mesai_baslangic", value: "09:00" },
+  { key: "mesai_bitis", value: "18:00" },
+  { key: "mesai_gunler", value: "1,2,3,4,5" },
+];
+defaultSettings.forEach(({ key, value }) => {
+  try {
+    db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run(key, value);
+  } catch (_) {}
+});
+
+function getSetting(key) {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key);
+  return row ? row.value : null;
+}
+
+function setSetting(key, value) {
+  db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value == null ? "" : String(value));
 }
 
 function getLeads(limit = 200) {
@@ -101,6 +127,7 @@ function mapRowToLead(row) {
     model: row.model ?? null,
     km: row.km ?? null,
     ruhsatSeriNo: row.ruhsat_seri_no ?? null,
+    aramaTercihi: row.arama_tercihi ?? null,
   };
 }
 
@@ -141,10 +168,11 @@ const COL_MAP = {
   chatId: "chat_id", createdAt: "created_at", imagePath: "image_path", markaKm: "marka_km", packageChoice: "package_choice",
   plateVerified: "plate_verified", offeredPrice: "offered_price", ruhsatData: "ruhsat_data",
   firstName: "first_name", lastName: "last_name", marka: "marka", model: "model", km: "km", ruhsatSeriNo: "ruhsat_seri_no",
+  aramaTercihi: "arama_tercihi",
 };
 
 function updateLead(id, updates) {
-  const allowed = ["plate", "plateVerified", "tc", "markaKm", "packageChoice", "phone", "status", "imagePath", "offeredPrice", "ruhsatData", "firstName", "lastName", "marka", "model", "km", "ruhsatSeriNo"];
+  const allowed = ["plate", "plateVerified", "tc", "markaKm", "packageChoice", "phone", "status", "imagePath", "offeredPrice", "ruhsatData", "firstName", "lastName", "marka", "model", "km", "ruhsatSeriNo", "aramaTercihi"];
   const set = [];
   const values = [];
   for (const key of allowed) {
@@ -253,4 +281,6 @@ module.exports = {
   getPackages,
   updatePackage,
   insertPackage,
+  getSetting,
+  setSetting,
 };
