@@ -341,6 +341,28 @@ function normalizeAndValidateRuhsatSeriNo(input) {
   return normalized.slice(0, 2) + " " + normalized.slice(2);
 }
 
+/** (Y.2) Tescil Sıra No: sadece rakamlar, 10–25 hane. */
+function validateTescilSiraNo(input) {
+  if (!input || typeof input !== "string") return null;
+  const digits = input.replace(/\D/g, "");
+  return digits.length >= 10 && digits.length <= 25 ? digits : null;
+}
+
+/** Ruhsat verisinde marka bilgisi var mı (ruhsattan okunmuşsa sadece km sorulur). */
+function hasMarkaFromRuhsat(lead) {
+  const rd = lead.ruhsatData || {};
+  return !!(lead.marka && String(lead.marka).trim()) || !!(rd.marka && String(rd.marka).trim()) || !!(rd.markaTip && String(rd.markaTip).trim());
+}
+
+/** Ruhsat sonrası sıradaki eksik alan: "tescil" | "belge" | "kullanim" | "marka_km". */
+function nextMissingRuhsatField(lead) {
+  const rd = lead.ruhsatData || {};
+  if (!(rd.ruhsatSeriNo && String(rd.ruhsatSeriNo).trim()) && !(lead.ruhsatSeriNo && String(lead.ruhsatSeriNo).trim())) return "tescil";
+  if (!(rd.belgeSeriNo && String(rd.belgeSeriNo).trim())) return "belge";
+  if (!(rd.kullanimTarzi || rd.kullanimAmaci) || !String(rd.kullanimTarzi || rd.kullanimAmaci).trim()) return "kullanim";
+  return "marka_km";
+}
+
 const MENU_TEXT =
    "Merhaba! Araç sigortası dijital asistanına hoş geldiniz. Aracınız ve güvenliğiniz için buradayım.\n\n" +
    "Size nasıl yardımcı olabilirim? Lütfen aşağıdan bir işlem seçin.";
@@ -505,18 +527,24 @@ bot.on("text", async (ctx) => {
       const ruhsatData = updated.ruhsatData || {};
       const hasTc = updated.tc && String(updated.tc).replace(/\D/g, "").length === 11;
       if (hasTc) {
-        const hasRuhsatSeri = ruhsatData.ruhsatSeriNo && String(ruhsatData.ruhsatSeriNo).trim();
-        const hasKullanim = (ruhsatData.kullanimTarzi || ruhsatData.kullanimAmaci) && String(ruhsatData.kullanimTarzi || ruhsatData.kullanimAmaci).trim();
-        if (!hasRuhsatSeri) {
-          setChatState(chatId, { mode: "ask_ruhsat_seri", leadId: lead.id });
-          const reply = `Teşekkürler. Plakanız ${lead.plate} olarak kaydedildi.\n\nSon olarak, resmi sorgulama için ruhsatınızın Seri Kod ve Numarasını yazar mısınız? (Örn: AA 123456 veya 2024080710265626393)`;
+        const next = nextMissingRuhsatField(updated);
+        if (next === "tescil") {
+          setChatState(chatId, { mode: "ask_tescil_sira", leadId: lead.id });
+          const reply = `Teşekkürler. Plakanız ${lead.plate} olarak kaydedildi.\n\nRuhsat görselinden Tescil Sıra No (Y.2) okunamadı. Lütfen ruhsatınızdaki (Y.2) TESCİL SIRA NO'yu (sadece rakamlar) yazar mısınız?`;
           addMessage(chatId, "bot", reply);
           await ctx.reply(reply);
           return;
         }
-        if (!hasKullanim) {
+        if (next === "belge") {
+          setChatState(chatId, { mode: "ask_belge_seri", leadId: lead.id });
+          const reply = `Ruhsat görselinden Belge Seri No (sağ alt, 2 harf + 6 rakam) okunamadı. Lütfen "belge seri" ve "No" kısmını yazar mısınız? (Örn: HF 964933)`;
+          addMessage(chatId, "bot", reply);
+          await ctx.reply(reply);
+          return;
+        }
+        if (next === "kullanim") {
           setChatState(chatId, { mode: "ask_kullanim_tarzi", leadId: lead.id });
-          const reply = `Teşekkürler.\n\nAracınızın kullanım tarzı nedir? (Örn: Hususi otomobil, kamyonet)`;
+          const reply = `Görselden okunamadı: Aracınızın kullanım tarzı nedir? (Örn: Hususi otomobil, kamyonet)`;
           addMessage(chatId, "bot", reply);
           await ctx.reply(reply);
           return;
@@ -524,7 +552,10 @@ bot.on("text", async (ctx) => {
         updated.status = "awaiting_marka_km";
         updateLead(lead.id, { status: "awaiting_marka_km" });
         setChatState(chatId, { mode: "ask_marka_km", leadId: lead.id });
-        const reply = `Teşekkürler. Plakanız ${lead.plate} olarak kaydedildi.\n\nAracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)`;
+        const hasMarka = hasMarkaFromRuhsat(updated);
+        const reply = hasMarka
+          ? `Teşekkürler. Plakanız ${lead.plate} olarak kaydedildi.\n\nAracınızın yaklaşık km bilgisini yazar mısınız? (Örn: 45000 km)`
+          : `Teşekkürler. Plakanız ${lead.plate} olarak kaydedildi.\n\nAracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)`;
         addMessage(chatId, "bot", reply);
         await ctx.reply(reply);
         return;
@@ -571,25 +602,32 @@ bot.on("text", async (ctx) => {
       const ruhsatData = updated.ruhsatData || {};
       const hasTc = updated.tc && String(updated.tc).replace(/\D/g, "").length === 11;
       if (hasTc) {
-        const hasRuhsatSeri = ruhsatData.ruhsatSeriNo && String(ruhsatData.ruhsatSeriNo).trim();
-        const hasKullanim = (ruhsatData.kullanimTarzi || ruhsatData.kullanimAmaci) && String(ruhsatData.kullanimTarzi || ruhsatData.kullanimAmaci).trim();
-        if (!hasRuhsatSeri) {
-          setChatState(chatId, { mode: "ask_ruhsat_seri", leadId: lead.id });
-          const msg = "Teşekkürler. Ruhsat Seri Kod ve Numarasını yazar mısınız? (Örn: AA 123456 veya 2024080710265626393)";
+        const next = nextMissingRuhsatField(updated);
+        if (next === "tescil") {
+          setChatState(chatId, { mode: "ask_tescil_sira", leadId: lead.id });
+          const msg = "Teşekkürler. Ruhsat görselinden Tescil Sıra No (Y.2) okunamadı. Lütfen (Y.2) TESCİL SIRA NO'yu (sadece rakamlar) yazar mısınız?";
           addMessage(chatId, "bot", msg);
           await ctx.reply(msg);
           return;
         }
-        if (!hasKullanim) {
+        if (next === "belge") {
+          setChatState(chatId, { mode: "ask_belge_seri", leadId: lead.id });
+          const msg = "Ruhsat görselinden Belge Seri No okunamadı. Sağ alttaki belge seri (2 harf) ve No (6 rakam) yazar mısınız? (Örn: HF 964933)";
+          addMessage(chatId, "bot", msg);
+          await ctx.reply(msg);
+          return;
+        }
+        if (next === "kullanim") {
           setChatState(chatId, { mode: "ask_kullanim_tarzi", leadId: lead.id });
-          const msg = "Aracınızın kullanım tarzı nedir? (Örn: Hususi otomobil, kamyonet)";
+          const msg = "Görselden okunamadı: Aracınızın kullanım tarzı nedir? (Örn: Hususi otomobil, kamyonet)";
           addMessage(chatId, "bot", msg);
           await ctx.reply(msg);
           return;
         }
         updateLead(lead.id, { status: "awaiting_marka_km" });
         setChatState(chatId, { mode: "ask_marka_km", leadId: lead.id });
-        const msg = "Teşekkürler.\n\nAracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)";
+        const hasMarka = hasMarkaFromRuhsat(updated);
+        const msg = hasMarka ? "Teşekkürler.\n\nAracınızın yaklaşık km bilgisini yazar mısınız? (Örn: 45000 km)" : "Teşekkürler.\n\nAracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)";
         addMessage(chatId, "bot", msg);
         await ctx.reply(msg);
         return;
@@ -622,20 +660,25 @@ bot.on("text", async (ctx) => {
       } else {
         updateLead(lead.id, { tc });
       }
-      const hasRuhsatSeri = ruhsatData.ruhsatSeriNo && String(ruhsatData.ruhsatSeriNo).trim();
-      const hasKullanim = (ruhsatData.kullanimTarzi || ruhsatData.kullanimAmaci) && String(ruhsatData.kullanimTarzi || ruhsatData.kullanimAmaci).trim();
-      if (!hasRuhsatSeri) {
-        setChatState(chatId, { mode: "ask_ruhsat_seri", leadId: lead.id });
-        const reply =
-          "Son olarak, resmi sorgulama için ruhsatınızın en altında yer alan Seri Kod ve Numarayı yazar mısınız? (Örn: AA 123456 veya BZ 987654)";
+      const updatedAfterTc = getLeadById(lead.id);
+      const next = nextMissingRuhsatField(updatedAfterTc);
+      if (next === "tescil") {
+        setChatState(chatId, { mode: "ask_tescil_sira", leadId: lead.id });
+        const reply = "Son olarak, ruhsat görselinden Tescil Sıra No (Y.2) okunamadı. Lütfen (Y.2) TESCİL SIRA NO'yu (sadece rakamlar) yazar mısınız?";
         addMessage(chatId, "bot", reply);
         await ctx.reply(reply);
         return;
       }
-      if (!hasKullanim) {
+      if (next === "belge") {
+        setChatState(chatId, { mode: "ask_belge_seri", leadId: lead.id });
+        const reply = "Ruhsat görselinden Belge Seri No okunamadı. Sağ alttaki belge seri (2 harf) ve No (6 rakam) yazar mısınız? (Örn: HF 964933)";
+        addMessage(chatId, "bot", reply);
+        await ctx.reply(reply);
+        return;
+      }
+      if (next === "kullanim") {
         setChatState(chatId, { mode: "ask_kullanim_tarzi", leadId: lead.id });
-        const reply =
-          "Aracınızın kullanım tarzı nedir? (Örn: Hususi otomobil, kamyonet, ticari taksi)";
+        const reply = "Görselden okunamadı: Aracınızın kullanım tarzı nedir? (Örn: Hususi otomobil, kamyonet, ticari taksi)";
         addMessage(chatId, "bot", reply);
         await ctx.reply(reply);
         return;
@@ -643,8 +686,84 @@ bot.on("text", async (ctx) => {
       lead.status = "awaiting_marka_km";
       updateLead(lead.id, { status: "awaiting_marka_km" });
       setChatState(chatId, { mode: "ask_marka_km", leadId: lead.id });
-      const reply =
-        "Teşekkürler.\n\nAracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)";
+      const hasMarka = hasMarkaFromRuhsat(updatedAfterTc);
+      const reply = hasMarka ? "Teşekkürler.\n\nAracınızın yaklaşık km bilgisini yazar mısınız? (Örn: 45000 km)" : "Teşekkürler.\n\nAracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)";
+      addMessage(chatId, "bot", reply);
+      await ctx.reply(reply);
+      return;
+    }
+  }
+
+  if (state && state.mode === "ask_tescil_sira") {
+    const tescilNo = validateTescilSiraNo(userText);
+    const lead = findLeadById(state.leadId);
+    if (!lead) {
+      setChatState(chatId, null);
+    } else if (!tescilNo) {
+      const reply = "Lütfen ruhsatınızdaki (Y.2) TESCİL SIRA NO'yu sadece rakamlarla yazın (10–25 hane).";
+      addMessage(chatId, "bot", reply);
+      await ctx.reply(reply);
+      return;
+    } else {
+      const ruhsatData = { ...(lead.ruhsatData || {}), ruhsatSeriNo: tescilNo };
+      lead.ruhsatData = ruhsatData;
+      updateLead(lead.id, { ruhsatData, ruhsatSeriNo: tescilNo });
+      const updated = getLeadById(lead.id);
+      const next = nextMissingRuhsatField(updated);
+      if (next === "belge") {
+        setChatState(chatId, { mode: "ask_belge_seri", leadId: lead.id });
+        const reply = "Ruhsat görselinden Belge Seri No okunamadı. Sağ alttaki belge seri (2 harf) ve No (6 rakam) yazar mısınız? (Örn: HF 964933)";
+        addMessage(chatId, "bot", reply);
+        await ctx.reply(reply);
+        return;
+      }
+      if (next === "kullanim") {
+        setChatState(chatId, { mode: "ask_kullanim_tarzi", leadId: lead.id });
+        const reply = "Görselden okunamadı: Aracınızın kullanım tarzı nedir? (Örn: Hususi otomobil, kamyonet)";
+        addMessage(chatId, "bot", reply);
+        await ctx.reply(reply);
+        return;
+      }
+      lead.status = "awaiting_marka_km";
+      updateLead(lead.id, { status: "awaiting_marka_km" });
+      setChatState(chatId, { mode: "ask_marka_km", leadId: lead.id });
+      const hasMarka = hasMarkaFromRuhsat(updated);
+      const reply = hasMarka ? "Aracınızın yaklaşık km bilgisini yazar mısınız? (Örn: 45000 km)" : "Aracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)";
+      addMessage(chatId, "bot", reply);
+      await ctx.reply(reply);
+      return;
+    }
+  }
+
+  if (state && state.mode === "ask_belge_seri") {
+    const belgeSeri = normalizeAndValidateRuhsatSeriNo(userText);
+    const lead = findLeadById(state.leadId);
+    if (!lead) {
+      setChatState(chatId, null);
+    } else if (!belgeSeri) {
+      const reply = "Belge Seri No 2 harf ve 6 rakamdan oluşur (örn: HF 964933). Lütfen bu formatta yazın.";
+      addMessage(chatId, "bot", reply);
+      await ctx.reply(reply);
+      return;
+    } else {
+      const normalized = belgeSeri.replace(/\s/g, "");
+      const ruhsatData = { ...(lead.ruhsatData || {}), belgeSeriNo: normalized };
+      lead.ruhsatData = ruhsatData;
+      updateLead(lead.id, { ruhsatData });
+      const updated = getLeadById(lead.id);
+      const next = nextMissingRuhsatField(updated);
+      if (next === "kullanim") {
+        setChatState(chatId, { mode: "ask_kullanim_tarzi", leadId: lead.id });
+        const reply = "Görselden okunamadı: Aracınızın kullanım tarzı nedir? (Örn: Hususi otomobil, kamyonet)";
+        addMessage(chatId, "bot", reply);
+        await ctx.reply(reply);
+        return;
+      }
+      lead.status = "awaiting_marka_km";
+      updateLead(lead.id, { status: "awaiting_marka_km" });
+      setChatState(chatId, { mode: "ask_marka_km", leadId: lead.id });
+      const hasMarka = hasMarkaFromRuhsat(updated);
+      const reply = hasMarka ? "Aracınızın yaklaşık km bilgisini yazar mısınız? (Örn: 45000 km)" : "Aracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)";
       addMessage(chatId, "bot", reply);
       await ctx.reply(reply);
       return;
@@ -663,14 +782,15 @@ bot.on("text", async (ctx) => {
       await ctx.reply(reply);
       return;
     } else {
-      const ruhsatData = { ...(lead.ruhsatData || {}), ruhsatSeriNo: seriNo };
+      const normalized = seriNo.replace(/\s/g, "");
+      const ruhsatData = { ...(lead.ruhsatData || {}), belgeSeriNo: normalized };
       lead.ruhsatData = ruhsatData;
-      updateLead(lead.id, { ruhsatData, ruhsatSeriNo: seriNo });
-      const hasKullanim = (ruhsatData.kullanimTarzi || ruhsatData.kullanimAmaci) && String(ruhsatData.kullanimTarzi || ruhsatData.kullanimAmaci).trim();
-      if (!hasKullanim) {
+      updateLead(lead.id, { ruhsatData });
+      const updated = getLeadById(lead.id);
+      const next = nextMissingRuhsatField(updated);
+      if (next === "kullanim") {
         setChatState(chatId, { mode: "ask_kullanim_tarzi", leadId: lead.id });
-        const reply =
-          "Aracınızın kullanım tarzı nedir? (Örn: Hususi otomobil, kamyonet, ticari taksi)";
+        const reply = "Görselden okunamadı: Aracınızın kullanım tarzı nedir? (Örn: Hususi otomobil, kamyonet, ticari taksi)";
         addMessage(chatId, "bot", reply);
         await ctx.reply(reply);
         return;
@@ -678,8 +798,8 @@ bot.on("text", async (ctx) => {
       lead.status = "awaiting_marka_km";
       updateLead(lead.id, { status: "awaiting_marka_km" });
       setChatState(chatId, { mode: "ask_marka_km", leadId: lead.id });
-      const reply =
-        "Teşekkürler.\n\nAracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)";
+      const hasMarka = hasMarkaFromRuhsat(updated);
+      const reply = hasMarka ? "Teşekkürler.\n\nAracınızın yaklaşık km bilgisini yazar mısınız? (Örn: 45000 km)" : "Teşekkürler.\n\nAracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)";
       addMessage(chatId, "bot", reply);
       await ctx.reply(reply);
       return;
@@ -703,9 +823,10 @@ bot.on("text", async (ctx) => {
       lead.status = "awaiting_marka_km";
       updateLead(lead.id, { status: "awaiting_marka_km" });
       setChatState(chatId, { mode: "ask_marka_km", leadId: lead.id });
-      const reply =
-        "Harika! Tüm bilgileri aldım. 🏁 Uzmanlarımız şimdi sizin için en iyi fiyatı çalışıyor.\n\n" +
-        "Son olarak aracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)";
+      const hasMarka = hasMarkaFromRuhsat(lead);
+      const reply = hasMarka
+        ? "Harika! Tüm bilgileri aldım. 🏁 Son olarak aracınızın yaklaşık km bilgisini yazar mısınız? (Örn: 45000 km)"
+        : "Harika! Tüm bilgileri aldım. 🏁 Son olarak aracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)";
       addMessage(chatId, "bot", reply);
       await ctx.reply(reply);
       return;
@@ -717,20 +838,33 @@ bot.on("text", async (ctx) => {
     const lead = findLeadById(state.leadId);
     if (!lead) {
       setChatState(chatId, null);
-    } else if (markaKm.length < 3) {
-      const reply = "Lütfen marka ve km bilgisini kısaca yazın (örn: Honda Civic 62000 km).";
-      addMessage(chatId, "bot", reply);
-      await ctx.reply(reply);
-      return;
     } else {
+      const hasMarka = hasMarkaFromRuhsat(lead);
       // 45000 km, 125.000 km, 45000 kilometre, veya sadece 45000 (4–6 rakam)
       const kmWithUnit = markaKm.match(/(\d[\d.\s]*?)\s*(?:km|kilometre)\s*$/i);
-      const kmOnly = markaKm.match(/\b(\d{4,6})\s*$/);
+      const kmOnly = markaKm.match(/\b(\d{4,7})\s*$/) || (hasMarka && markaKm.match(/^(\d{4,7})$/));
       const kmMatch = kmWithUnit || kmOnly;
       const kmRaw = kmMatch ? String(kmMatch[1]).replace(/[\s.]/g, "") : null;
       const km = kmRaw && /^\d+$/.test(kmRaw) ? kmRaw : null;
-      const marka = kmMatch ? markaKm.replace(kmMatch[0], "").trim() : markaKm;
-      const updates = { markaKm, status: "fiyat_bekleniyor" };
+      const marka = hasMarka ? null : (kmMatch ? markaKm.replace(kmMatch[0], "").trim() : markaKm);
+
+      if (hasMarka) {
+        if (!km) {
+          const reply = "Lütfen yaklaşık km bilgisini yazın (örn: 45000 veya 45000 km).";
+          addMessage(chatId, "bot", reply);
+          await ctx.reply(reply);
+          return;
+        }
+      } else {
+        if (markaKm.length < 3 || !km) {
+          const reply = "Lütfen marka ve km bilgisini kısaca yazın (örn: Honda Civic 62000 km).";
+          addMessage(chatId, "bot", reply);
+          await ctx.reply(reply);
+          return;
+        }
+      }
+
+      const updates = { markaKm: markaKm || (lead.markaKm || ""), status: "fiyat_bekleniyor" };
       if (marka) updates.marka = marka;
       if (km) updates.km = km;
       updateLead(lead.id, updates);
