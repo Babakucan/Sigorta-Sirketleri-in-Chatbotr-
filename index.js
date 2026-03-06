@@ -3,7 +3,6 @@ const path = require("path");
 const fs = require("fs");
 const dotenv = require("dotenv");
 const { Telegraf, Markup } = require("telegraf");
-const Tesseract = require("tesseract.js");
 const { getLeads, getLeadById, insertLead, updateLead, getConversations, addConversation, getPackages, updatePackage, insertPackage } = require("./db");
 
 dotenv.config();
@@ -193,6 +192,27 @@ app.get("/api/leads/:id/photo", apiAuth, (req, res) => {
   res.sendFile(path.resolve(lead.imagePath));
 });
 
+/** Ruhsat fotoğrafından AI analiz tekrar çalıştırır; mevcut lead’i ruhsatData ve tc/isim vb. ile günceller */
+app.post("/api/leads/:id/reparse-ruhsat", apiAuth, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: "Geçersiz teklif ID." });
+  const lead = getLeadById(id);
+  if (!lead) return res.status(404).json({ error: "Teklif bulunamadı." });
+  if (!lead.imagePath || !fs.existsSync(lead.imagePath)) {
+    return res.status(400).json({ error: "Bu teklifte ruhsat görseli yok." });
+  }
+  try {
+    const ruhsatData = await extractRuhsatFromImage(lead.imagePath) || {};
+    const sync = syncLeadFieldsFromRuhsat(ruhsatData);
+    updateLead(id, { ruhsatData, ...sync });
+    const updated = getLeadById(id);
+    res.json(updated);
+  } catch (e) {
+    console.error("Reparse ruhsat:", e.message);
+    res.status(500).json({ error: "Ruhsat analiz edilemedi: " + (e.message || "Bilinmeyen hata") });
+  }
+});
+
 // Serve uploaded photos only for admin (secret required by middleware)
 app.get("/admin/photo/:filename", (req, res) => {
   const raw = req.params.filename;
@@ -327,9 +347,17 @@ function findLeadById(id) {
 function syncLeadFieldsFromRuhsat(ruhsatData) {
   if (!ruhsatData || typeof ruhsatData !== "object") return {};
   const o = {};
+  if (ruhsatData.tcKimlik && String(ruhsatData.tcKimlik).replace(/\D/g, "").length === 11) o.tc = String(ruhsatData.tcKimlik).replace(/\D/g, "");
+  if (ruhsatData.sahibiAdiSoyadi && String(ruhsatData.sahibiAdiSoyadi).trim()) {
+    const parts = String(ruhsatData.sahibiAdiSoyadi).trim().split(/\s+/);
+    if (parts.length >= 1) o.firstName = parts[0];
+    if (parts.length >= 2) o.lastName = parts.slice(1).join(" ");
+  }
   if (ruhsatData.ruhsatSeriNo) o.ruhsatSeriNo = ruhsatData.ruhsatSeriNo;
   if (ruhsatData.markaTip || ruhsatData.marka) o.marka = ruhsatData.markaTip || ruhsatData.marka;
   if (ruhsatData.tipi) o.model = ruhsatData.tipi;
+  if (ruhsatData.modelYili) o.model = o.model ? `${o.model} ${ruhsatData.modelYili}` : String(ruhsatData.modelYili);
+  if (ruhsatData.plaka && String(ruhsatData.plaka).replace(/\s/g, "").length >= 5) o.plate = String(ruhsatData.plaka).replace(/\s/g, "").toUpperCase().trim();
   return o;
 }
 
@@ -525,6 +553,34 @@ bot.on("text", async (ctx) => {
       lead.plateVerified = true;
       lead.status = "plate_confirmed";
       updateLead(lead.id, { plate: lead.plate, plateVerified: true, status: "plate_confirmed" });
+      const updated = getLeadById(lead.id);
+      const ruhsatData = updated.ruhsatData || {};
+      const hasTc = updated.tc && String(updated.tc).replace(/\D/g, "").length === 11;
+      if (hasTc) {
+        const hasRuhsatSeri = ruhsatData.ruhsatSeriNo && String(ruhsatData.ruhsatSeriNo).trim();
+        const hasKullanim = (ruhsatData.kullanimTarzi || ruhsatData.kullanimAmaci) && String(ruhsatData.kullanimTarzi || ruhsatData.kullanimAmaci).trim();
+        if (!hasRuhsatSeri) {
+          setChatState(chatId, { mode: "ask_ruhsat_seri", leadId: lead.id });
+          const reply = `Teşekkürler. Plakanız ${lead.plate} olarak kaydedildi.\n\nSon olarak, resmi sorgulama için ruhsatınızın Seri Kod ve Numarasını yazar mısınız? (Örn: AA 123456 veya 2024080710265626393)`;
+          addMessage(chatId, "bot", reply);
+          await ctx.reply(reply);
+          return;
+        }
+        if (!hasKullanim) {
+          setChatState(chatId, { mode: "ask_kullanim_tarzi", leadId: lead.id });
+          const reply = `Teşekkürler.\n\nAracınızın kullanım tarzı nedir? (Örn: Hususi otomobil, kamyonet)`;
+          addMessage(chatId, "bot", reply);
+          await ctx.reply(reply);
+          return;
+        }
+        updated.status = "awaiting_marka_km";
+        updateLead(lead.id, { status: "awaiting_marka_km" });
+        setChatState(chatId, { mode: "ask_marka_km", leadId: lead.id });
+        const reply = `Teşekkürler. Plakanız ${lead.plate} olarak kaydedildi.\n\nAracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)`;
+        addMessage(chatId, "bot", reply);
+        await ctx.reply(reply);
+        return;
+      }
       setChatState(chatId, { mode: "ask_tc", leadId: lead.id });
       const reply =
         `Teşekkürler. Plakanız ${lead.plate} olarak kaydedildi.\n\n` +
@@ -563,6 +619,33 @@ bot.on("text", async (ctx) => {
       lead.plateVerified = false;
       lead.status = "plate_manual";
       updateLead(lead.id, { plate, plateVerified: false, status: "plate_manual" });
+      const updated = getLeadById(lead.id);
+      const ruhsatData = updated.ruhsatData || {};
+      const hasTc = updated.tc && String(updated.tc).replace(/\D/g, "").length === 11;
+      if (hasTc) {
+        const hasRuhsatSeri = ruhsatData.ruhsatSeriNo && String(ruhsatData.ruhsatSeriNo).trim();
+        const hasKullanim = (ruhsatData.kullanimTarzi || ruhsatData.kullanimAmaci) && String(ruhsatData.kullanimTarzi || ruhsatData.kullanimAmaci).trim();
+        if (!hasRuhsatSeri) {
+          setChatState(chatId, { mode: "ask_ruhsat_seri", leadId: lead.id });
+          const msg = "Teşekkürler. Ruhsat Seri Kod ve Numarasını yazar mısınız? (Örn: AA 123456 veya 2024080710265626393)";
+          addMessage(chatId, "bot", msg);
+          await ctx.reply(msg);
+          return;
+        }
+        if (!hasKullanim) {
+          setChatState(chatId, { mode: "ask_kullanim_tarzi", leadId: lead.id });
+          const msg = "Aracınızın kullanım tarzı nedir? (Örn: Hususi otomobil, kamyonet)";
+          addMessage(chatId, "bot", msg);
+          await ctx.reply(msg);
+          return;
+        }
+        updateLead(lead.id, { status: "awaiting_marka_km" });
+        setChatState(chatId, { mode: "ask_marka_km", leadId: lead.id });
+        const msg = "Teşekkürler.\n\nAracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)";
+        addMessage(chatId, "bot", msg);
+        await ctx.reply(msg);
+        return;
+      }
       setChatState(chatId, { mode: "ask_tc", leadId: lead.id });
       const reply =
         "Teşekkürler! 🚗 Şimdi, size özel hasarsızlık indirimlerini sorgulayabilmemiz için T.C. Kimlik Numaranızı alabilir miyim? (11 rakam)";
@@ -826,113 +909,75 @@ async function sendPackageCompletion(ctx, chatId, lead, pkg) {
   await ctx.reply(reply);
 }
 
-/** Ruhsat (Trafik Tescil Belgesi) OCR metninden sigorta için kullanılan alanları parse eder.
- *  Ön yüz: Plaka, Ruhsat Seri/No (TRAMER), Tescil Tarihi, T.C. Kimlik/Vergi No.
- *  Arka yüz: Şasi No (VIN 17 hane), Motor No, Marka/Tip, Model Yılı, Kullanım Tarzı, Araç Kodu. */
-function parseRuhsatFromText(text) {
-  if (!text || typeof text !== "string") return {};
-  const t = text.replace(/\r\n/g, "\n");
-  const result = {};
-  const takeAfter = (labelPattern, lineRegex) => {
-    const re = new RegExp(labelPattern, "i");
-    const lines = t.split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (re.test(line)) {
-        const match = lineRegex ? line.match(lineRegex) : null;
-        if (match && match[1]) return match[1].trim();
-        const after = line.replace(re, "").replace(/^[:\s\-]+/, "").trim();
-        if (after) return after;
-        if (lines[i + 1]) return lines[i + 1].trim();
-        break;
-      }
-    }
-    return null;
-  };
-  // Ön yüz – kimlik ve aidiyet
-  result.plaka = takeAfter("PLAKA", /PLAKA\s*[:\-]?\s*(.+)/i) || takeAfter("Plaka", /Plaka\s*[:\-]?\s*(.+)/i);
-  const seriNoMatch = t.match(/\b([A-Z]{2,3}\s*\d{5,7})\b/);
-  result.ruhsatSeriNo = takeAfter("RUHSAT\s*SER[İI]\s*(?:VE\s*)?NO", /(?:RUHSAT\s*SER[İI]\s*(?:VE\s*)?NO\.?\s*[:\-]?\s*)([A-Z]{2,3}\s*\d{5,7})/i)
-    || takeAfter("BELGE\s*NO", /(?:BELGE\s*NO\.?\s*[:\-]?\s*)([A-Z]{2,3}\s*\d{5,7})/i)
-    || (seriNoMatch ? seriNoMatch[1] : null);
-  result.tescilTarihi = takeAfter("TESC[İI]L\s*TAR[İI]H[İI]", /(\d{2}[-\/\.]\d{2}[-\/\.]\d{4})/);
-  const tcInText = t.match(/\b(\d{11})\b/);
-  result.tcKimlik = tcInText ? tcInText[1] : null;
-  result.sahibiAdiSoyadi = takeAfter("SAH[İI]B[İI]N[İI]N\s*ADI", /SAH[İI]B[İI]N[İI]N\s*ADI\s*SOYADI\s*[\/\s]*[:\-]?\s*(.+)/i) || takeAfter("Sahibinin Adi Soyadi", /Sahibinin\s*Adi\s*Soyadi\s*[:\-]?\s*(.+)/i);
+/** Ruhsat fotoğrafından AI görsel analiz ile bilgileri çıkarır (OpenAI Vision API) */
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const RUHSAT_PROMPT = `Bu görsel Türkiye Trafik Tescil Belgesi (ruhsat) fotoğrafıdır.
+Aşağıdaki JSON anahtarlarına göre gördüğün tüm bilgileri çıkar. Bulamadığın alan için null kullan.
+Sadece geçerli JSON döndür, markdown veya açıklama ekleme.
 
-  // Arka yüz – teknik (fiyatlandırma)
-  result.marka = takeAfter("MARKA", /MARKA\s*[:\-]?\s*(.+)/i) || takeAfter("Marka", /Marka\s*[:\-]?\s*(.+)/i);
-  result.tipi = takeAfter("T[İI]P[İI]", /T[İI]P[İI]\s*[:\-]?\s*(.+)/i) || takeAfter("Tipi", /Tipi\s*[:\-]?\s*(.+)/i);
-  const markaTip = [result.marka, result.tipi].filter(Boolean).join(" ");
-  if (markaTip) result.markaTip = markaTip.trim();
-  result.modelYili = takeAfter("MODEL\s*YILI", /MODEL\s*YILI\s*[:\-]?\s*(\d{4})/i) || takeAfter("Model Yili", /Model\s*Yili\s*[:\-]?\s*(\d{4})/i) || t.match(/\b(19|20)\d{2}\b/)?.[0];
-  result.renk = takeAfter("RENK", /RENK\s*[:\-]?\s*(.+)/i) || takeAfter("Renk", /Renk\s*[:\-]?\s*(.+)/i);
-  result.motorNo = takeAfter("MOTOR\s*NO", /MOTOR\s*NO\.?\s*[:\-]?\s*([A-Z0-9\-]+)/i) || takeAfter("Motor No", /Motor\s*No\.?\s*[:\-]?\s*([A-Z0-9\-]+)/i);
-  let sasi = takeAfter("[SŞ]AS[İI]\s*NO", /[SŞ]AS[İI]\s*NO\.?\s*[:\-]?\s*([A-HJ-NPR-Z0-9]{17})/i) || takeAfter("[SŞ]AS[İI]\s*NO", /[SŞ]AS[İI]\s*NO\.?\s*[:\-]?\s*([A-Z0-9W\-]+)/i);
-  if (sasi) sasi = sasi.replace(/\s/g, "").replace(/-/g, "");
-  result.sasiNo = (sasi && sasi.length === 17) ? sasi : sasi || null;
-  result.motorGucu = takeAfter("MOTOR\s*G[UÜ]C[UÜ]", /MOTOR\s*G[UÜ]C[UÜ].*?(\d+)\s*HP/i) || takeAfter("Motor Gucu", /Motor\s*Gucu.*?(\d+)/i);
-  result.silindirHacmi = takeAfter("S[İI]L[İI]ND[İI]R\s*HACM[İI]", /S[İI]L[İI]ND[İI]R\s*HACM[İI].*?(\d+)/i) || takeAfter("Silindir Hacmi", /Silindir\s*Hacmi.*?(\d+)/i);
-  result.kullanimAmaci = takeAfter("KULLANIM\s*AMACI", /KULLANIM\s*AMACI\s*[:\-]?\s*([A-Za-zıİğĞüÜşŞöÖçÇ\s]+)/i) || takeAfter("Kullanim Amaci", /Kullanim\s*Amaci\s*[:\-]?\s*(.+)/i);
-  result.kullanimTarzi = takeAfter("KULLANIM\s*TARZI", /KULLANIM\s*TARZI\s*[:\-]?\s*([A-Za-zıİğĞüÜşŞöÖçÇ\s]+)/i) || result.kullanimAmaci;
-  result.aracKodu = takeAfter("ARA[ÇC]\s*KODU", /ARA[ÇC]\s*KODU\s*[:\-]?\s*([\d\-]+)/i) || takeAfter("Arac Kodu", /Arac\s*Kodu\s*[:\-]?\s*([\d\-]+)/i);
-  result.tasimaKapasitesi = takeAfter("TA[ŞS]IMA\s*KAPAS[İI]TES[İI]", /TA[ŞS]IMA\s*KAPAS[İI]TES[İI].*?(\d+)/i);
-  result.yukluAgirlik = takeAfter("Y[UÜ]KL[UÜ]\s*A[ĞG]IRLIK", /Y[UÜ]KL[UÜ]\s*A[ĞG]IRLIK.*?(\d+)/i);
-  result.sonMuayeneTarihi = takeAfter("SON\s*MUAYENE", /(\d{2}[-\/]\d{2}[-\/]\d{4})/);
-  result.trafigeCikisTarihi = takeAfter("TRAF[İI][ĞG]E\s*[ÇC][İI]KI[ŞS]", /(\d{2}[-\/]\d{2}[-\/]\d{4})/);
-  return Object.fromEntries(Object.entries(result).filter(([, v]) => v != null && String(v).trim() !== ""));
-}
+{
+  "plaka": "34KN5930 formatında",
+  "tcKimlik": "11 haneli TC kimlik no",
+  "sahibiAdiSoyadi": "Ad Soyad",
+  "ruhsatSeriNo": "TESCİL SIRA NO veya Ruhsat Seri No",
+  "marka": "örn HYUNDAI",
+  "tipi": "örn PBT, 120",
+  "modelYili": "örn 2013",
+  "markaTip": "marka + tip birleşik",
+  "kullanimTarzi": "örn OTOMOBİL (AF ÇOK AMAÇLI)",
+  "kullanimAmaci": "kullanım amacı",
+  "tescilTarihi": "gg/aa/yyyy",
+  "sasiNo": "17 haneli VIN",
+  "motorNo": "motor no",
+  "renk": "örn BEYAZ"
+}`;
 
-/** Türkiye plaka formatı: 34 ABC 123 veya 34 A 1234 - OCR metninden ilk eşleşmeyi döndürür */
-function parsePlateFromText(text) {
-  if (!text || typeof text !== "string") return null;
-  const cleaned = text.replace(/\s+/g, " ").trim().toUpperCase();
-  const withSpaces = cleaned.match(/\d{2}\s*[A-Z]{1,3}\s*\d{2,4}/);
-  const noSpaces = cleaned.replace(/\s/g, "").match(/(\d{2})([A-Z]{1,3})(\d{2,4})/);
-  const raw = withSpaces
-    ? withSpaces[0].replace(/\s+/g, " ").trim()
-    : noSpaces
-      ? `${noSpaces[1]} ${noSpaces[2]} ${noSpaces[3]}`
-      : null;
-  if (!raw) return null;
-  const parts = raw.split(/\s+/);
-  if (parts.length >= 3) return `${parts[0]} ${parts[1]} ${parts[2]}`;
-  return raw.length >= 5 ? raw : null;
-}
-
-async function extractPlateFromImage(filePath) {
-  if (!filePath || !fs.existsSync(filePath)) return null;
-  let worker;
-  try {
-    worker = await Tesseract.createWorker("eng", 1, {
-      logger: () => {},
-    });
-    const {
-      data: { text },
-    } = await worker.recognize(filePath, {}, {});
-    const plate = parsePlateFromText(text);
-    return plate || null;
-  } catch (err) {
-    console.error("OCR error:", err.message);
-    return null;
-  } finally {
-    if (worker) await worker.terminate();
-  }
-}
-
-/** Ruhsat fotoğrafından Tesseract (tur+eng) ile OCR yapıp tüm ruhsat alanlarını döndürür */
 async function extractRuhsatFromImage(filePath) {
   if (!filePath || !fs.existsSync(filePath)) return {};
-  let worker;
-  try {
-    worker = await Tesseract.createWorker(["tur", "eng"], 1, { logger: () => {} });
-    const { data: { text } } = await worker.recognize(filePath, {}, {});
-    return parseRuhsatFromText(text) || {};
-  } catch (err) {
-    console.error("Ruhsat OCR error:", err.message);
+  if (!OPENAI_API_KEY) {
+    console.warn("OPENAI_API_KEY tanımlı değil, ruhsat AI analizi atlanıyor.");
     return {};
-  } finally {
-    if (worker) await worker.terminate();
+  }
+  try {
+    const buf = fs.readFileSync(filePath);
+    const base64 = buf.toString("base64");
+    const ext = (path.extname(filePath) || "").toLowerCase();
+    const mime = ext === ".png" ? "image/png" : "image/jpeg";
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        max_tokens: 1024,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: RUHSAT_PROMPT },
+              { type: "image_url", image_url: { url: `data:${mime};base64,${base64}` } },
+            ],
+          },
+        ],
+        response_format: { type: "json_object" },
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`OpenAI API ${res.status}: ${err}`);
+    }
+    const data = await res.json();
+    const raw = data.choices?.[0]?.message?.content;
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([, v]) => v != null && String(v).trim() !== "" && v !== "null")
+    );
+  } catch (err) {
+    console.error("Ruhsat AI analiz hatası:", err.message);
+    return {};
   }
 }
 
@@ -982,7 +1027,7 @@ bot.on("photo", async (ctx) => {
     });
   }
 
-  // Ruhsat OCR: sigorta için gerekli tüm alanları çek (TRAMER, risk analizi)
+  // Ruhsat AI analiz: sigorta için gerekli tüm alanları çek (TRAMER, risk analizi)
   let ruhsatData = {};
   if (savedPath) {
     try {
@@ -992,12 +1037,11 @@ bot.on("photo", async (ctx) => {
         lead.ruhsatData = ruhsatData;
       }
     } catch (e) {
-      console.error("Ruhsat OCR:", e.message);
+      console.error("Ruhsat AI analiz:", e.message);
     }
   }
 
-  const guessedPlate = (ruhsatData.plaka && ruhsatData.plaka.trim()) ? ruhsatData.plaka.trim()
-    : (savedPath ? await extractPlateFromImage(savedPath) : null);
+  const guessedPlate = (ruhsatData.plaka && ruhsatData.plaka.trim()) ? ruhsatData.plaka.trim() : null;
 
   const ruhsatSummary = [];
   if (ruhsatData.ruhsatSeriNo) ruhsatSummary.push(`Ruhsat No: ${ruhsatData.ruhsatSeriNo}`);

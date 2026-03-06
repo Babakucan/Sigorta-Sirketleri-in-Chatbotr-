@@ -42,7 +42,7 @@ Admin arayüzünü Figma’da taslayıp Cursor’da tasarımdan koda dönüştü
 
 ## Klasör yapısı
 
-- `index.js` — Express API + Telegram bot (Telegraf), OCR (Tesseract)
+- `index.js` — Express API + Telegram bot (Telegraf), ruhsat görsel analizi (OpenAI Vision)
 - `db.js` — SQLite (better-sqlite3), leads / conversations / packages
 - `admin-app/` — React (Vite) admin paneli
 - `uploads/` — Ruhsat fotoğrafları (otomatik oluşur, git’e eklenmez)

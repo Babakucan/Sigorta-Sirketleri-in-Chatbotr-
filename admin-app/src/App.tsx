@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 
 const API_BASE = ''
 
-/** Ruhsat OCR ile okunan alanlar (TRAMER / risk analizi için) */
+/** Ruhsat AI ile okunan alanlar (TRAMER / risk analizi için) */
 type RuhsatData = {
   plaka?: string
   ruhsatSeriNo?: string
@@ -199,7 +199,18 @@ function useApi(token: string | null) {
     return URL.createObjectURL(blob)
   }, [token])
 
-  return { fetchLeads, fetchConversations, fetchPackages, savePackages, createPackage, sendLeadQuote, getLeadPhotoUrl }
+  const reparseRuhsat = useCallback(async (leadId: number): Promise<Lead | null> => {
+    if (!token) return null
+    const res = await fetch(`${API_BASE}/api/leads/${leadId}/reparse-ruhsat`, { method: 'POST', headers: headers() })
+    if (res.status === 401) throw new Error('SESSION_EXPIRED')
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || 'Ruhsat okunamadı')
+    }
+    return res.json()
+  }, [token])
+
+  return { fetchLeads, fetchConversations, fetchPackages, savePackages, createPackage, sendLeadQuote, getLeadPhotoUrl, reparseRuhsat }
 }
 
 function LeadDetailModal({
@@ -213,6 +224,8 @@ function LeadDetailModal({
   quoteError,
   onSendQuote,
   sendingQuote,
+  onReparseRuhsat,
+  reparseLoading,
 }: {
   lead: Lead
   onClose: () => void
@@ -224,6 +237,8 @@ function LeadDetailModal({
   quoteError: string
   onSendQuote: () => void
   sendingQuote: boolean
+  onReparseRuhsat?: (leadId: number) => Promise<Lead | null>
+  reparseLoading?: boolean
 }) {
   const [photoUrl, setPhotoUrl] = useState<string | null>(null)
   const photoUrlRef = useRef<string | null>(null)
@@ -311,6 +326,16 @@ function LeadDetailModal({
               <p className="muted">Yükleniyor…</p>
             ) : (
               <p className="muted">Bu talepte ruhsat görseli yok.</p>
+            )}
+            {lead.imagePath && onReparseRuhsat && (
+              <button
+                type="button"
+                className="btn-reparse-ruhsat"
+                onClick={() => onReparseRuhsat(lead.id)}
+                disabled={reparseLoading}
+              >
+                {reparseLoading ? 'Okunuyor…' : 'Ruhsattan tekrar oku'}
+              </button>
             )}
           </div>
         </div>
@@ -589,7 +614,7 @@ function PackagesView({
 }
 
 function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogout: () => void; theme: 'light' | 'dark'; setTheme: (t: 'light' | 'dark') => void }) {
-  const { fetchLeads, fetchConversations, fetchPackages, savePackages, sendLeadQuote, getLeadPhotoUrl } = useApi(token)
+  const { fetchLeads, fetchConversations, fetchPackages, savePackages, sendLeadQuote, getLeadPhotoUrl, reparseRuhsat } = useApi(token)
   const [leads, setLeads] = useState<Lead[]>([])
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [packages, setPackages] = useState<Package[]>([])
@@ -605,6 +630,7 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
   const [quotePrice, setQuotePrice] = useState<string>('')
   const [sendingQuote, setSendingQuote] = useState(false)
   const [quoteError, setQuoteError] = useState('')
+  const [reparseLoading, setReparseLoading] = useState(false)
   const [packagesSaveSuccess, setPackagesSaveSuccess] = useState(false)
   const [leadDateFrom, setLeadDateFrom] = useState('')
   const [leadDateTo, setLeadDateTo] = useState('')
@@ -724,6 +750,24 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
     }
     setQuotePrice(detailLead.offeredPrice != null ? String(detailLead.offeredPrice) : '')
   }, [detailLead])
+
+  const handleReparseRuhsat = useCallback(
+    async (leadId: number): Promise<Lead | null> => {
+      setReparseLoading(true)
+      setQuoteError('')
+      try {
+        const updated = await reparseRuhsat(leadId)
+        if (updated) setDetailLead(updated)
+        return updated
+      } catch (e) {
+        setQuoteError(e instanceof Error ? e.message : 'Ruhsat tekrar okunamadı')
+        return null
+      } finally {
+        setReparseLoading(false)
+      }
+    },
+    [reparseRuhsat]
+  )
 
   const handleSendQuote = useCallback(async () => {
     if (!detailLead || !quotePrice.trim()) return
@@ -895,6 +939,8 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
           quoteError={quoteError}
           onSendQuote={handleSendQuote}
           sendingQuote={sendingQuote}
+          onReparseRuhsat={handleReparseRuhsat}
+          reparseLoading={reparseLoading}
         />
       )}
     </div>
