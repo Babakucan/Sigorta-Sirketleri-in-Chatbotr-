@@ -1,0 +1,45 @@
+---
+description: GitHub fork ile arkadaşla senkron hatırlatması – değişiklikleri uygulamak için
+alwaysApply: true
+---
+
+# GitHub Fork – Arkadaşla Değişiklik Senkronu
+
+Bu projede **fork** kullanıyorsun: sen ve arkadaşın ayrı kopyalarda çalışıyorsunuz. Aşağıdakileri **değişiklik uygulamak / göndermek** için kullan.
+
+## Arkadaşının değişikliklerini almak (senin bilgisayarına uygula)
+
+Arkadaşın kendi fork’unda değişiklik yaptıysa, onları bu projeye almak için:
+
+1. **Bir kez yapılacak:** Arkadaşının fork’unu remote ekle. URL’yi arkadaşından al (örn. `https://github.com/ArkadasininGitHubAdi/Sigorta-Sirketleri-in-Chatbotr-.git`). Proje klasöründe:
+   ```bash
+   git remote add arkadas https://github.com/ArkadasininGitHubAdi/Sigorta-Sirketleri-in-Chatbotr-.git
+   ```
+   (ArkadasininGitHubAdi yerine arkadaşının GitHub kullanıcı adını yaz.)
+
+2. **Her seferinde arkadaş “değişiklik yaptım” dediğinde:**
+   ```bash
+   git fetch arkadas
+   git merge arkadas/feature/bot-experience
+   ```
+   (Eğer farklı dal kullanıyorsa `feature/bot-experience` yerine o dal adını yaz.)
+
+3. Çakışma (conflict) çıkarsa dosyaları düzenleyip `git add` ve `git commit` ile bitir.
+
+## Kendi değişikliklerini arkadaşına göndermek
+
+1. Önce kendi repona (veya ana repoya) push et:
+   ```bash
+   git add .
+   git commit -m "Kısa açıklama"
+   git push origin feature/bot-experience
+   ```
+
+2. Arkadaşına söyle: “Değişiklikleri push ettim.” Arkadaş kendi Cursor’ındaki prompt’a göre senin reponu remote ekleyip `fetch` + `merge` yapacak.
+
+## Hızlı hatırlatma (her oturumda)
+
+- **Arkadaşın değişiklik yaptıysa** → `git fetch arkadas` sonra `git merge arkadas/<dal-adı>`
+- **Sen değişiklik yaptıysan** → `git add .` → `git commit -m "açıklama"` → `git push origin <dal-adı>`
+
+`.env` dosyası asla repoya gitmez; arkadaş kendi `.env`’ini kullanır.

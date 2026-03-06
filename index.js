@@ -62,7 +62,10 @@ function escapeHtml(str) {
 
 // Simple auth middleware for admin routes
 app.use("/admin", (req, res, next) => {
-   const authHeader = req.headers["x-admin-secret"] || req.query.secret;
+  if (req.method === "GET" && (req.path === "" || req.path === "/")) {
+    return res.redirect(302, "/app/");
+  }
+  const authHeader = req.headers["x-admin-secret"] || req.query.secret;
   if (authHeader !== ADMIN_SECRET) {
     return res
       .status(401)
@@ -92,9 +95,7 @@ app.get("/ping", (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.send(
-    '<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Sigorta Chatbot</title><style>body{font-family:system-ui,sans-serif;max-width:600px;margin:48px auto;padding:24px;background:#0f172a;color:#e5e7eb;}h1{font-size:1.25rem;}a{color:#60a5fa;}code{background:#1e293b;padding:2px 6px;border-radius:4px;}</style></head><body><h1>Sigorta Chatbot – Yönetim</h1><p>Teklif taleplerini görmek için <a href="/admin">yönetim paneline</a> veya <a href="/app">yeni admin uygulamasına</a> gidin.</p></body></html>'
-  );
+  res.redirect(302, "/app/");
 });
 
 function apiAuth(req, res, next) {
@@ -238,82 +239,10 @@ app.get("/admin/photo/:filename", (req, res) => {
   res.sendFile(path.resolve(filePath));
 });
 
+// Yeni React admin arayüzüne yönlendir (eski HTML /admin artık kullanılmıyor)
 app.get("/admin", (req, res) => {
-  const secret = req.query.secret || "";
-  const conversations = getConversations();
-  const items = conversations
-    .map((c) => {
-      const time = new Date(c.timestamp).toLocaleString("tr-TR");
-      if (c.type === "photo" && c.filePath) {
-        const basename = path.basename(c.filePath);
-        const imgUrl = `/admin/photo/${basename}?secret=${encodeURIComponent(
-          secret
-        )}`;
-        return `<li><strong>${c.chatId}</strong> · ${c.role}: <span class="badge">Fotoğraf</span> <img src="${imgUrl}" alt="Ruhsat" class="thumb" /> <small>${time}</small></li>`;
-      }
-      return `<li><strong>${c.chatId}</strong> · ${c.role}: ${escapeHtml(
-        c.text
-      )} <small>${time}</small></li>`;
-    })
-    .join("");
-
-  const leads = getLeads();
-  const leadItems = leads
-    .map((lead) => {
-      const time = new Date(lead.createdAt).toLocaleString("tr-TR");
-      const statusLabel = escapeHtml(STATUS_LABELS[lead.status] || lead.status || "—");
-      const plate = escapeHtml(lead.plate || "—");
-      const verified = lead.plateVerified ? "Onaylı" : "Elle girildi";
-      const tcMask = lead.tc ? `${lead.tc.slice(0, 3)}*****${lead.tc.slice(-2)}` : "—";
-      const markaKm = escapeHtml((lead.markaKm || "—").slice(0, 40));
-      const pkg = escapeHtml(lead.packageChoice || "—");
-      let photoHtml = "";
-      if (lead.imagePath) {
-        const basename = path.basename(lead.imagePath);
-        const imgUrl = `/admin/photo/${basename}?secret=${encodeURIComponent(
-          secret
-        )}`;
-        photoHtml = `<img src="${imgUrl}" alt="Ruhsat" class="thumb" />`;
-      }
-      return `<li><strong>Teklif #${lead.id}</strong> · Chat ${lead.chatId} · Plaka: <code>${plate}</code> · TC: ${tcMask} · ${markaKm} · Paket: ${pkg} · <span class="badge badge-muted">${statusLabel}</span> ${photoHtml} <small>${time}</small></li>`;
-    })
-    .join("");
-
-  res.send(`
-     <!DOCTYPE html>
-     <html lang="en">
-     <head>
-       <meta charset="UTF-8" />
-       <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-       <title>Teklif Talepleri · Sigorta Chatbot</title>
-       <style>
-         body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; padding: 24px; background: #0f172a; color: #e5e7eb; }
-         h1 { margin-bottom: 16px; }
-         .card { background: #020617; border-radius: 12px; padding: 16px 20px; border: 1px solid #1f2937; box-shadow: 0 10px 30px rgba(0,0,0,0.4); }
-         ul { list-style: none; padding: 0; margin: 0; max-height: 60vh; overflow-y: auto; }
-         li { padding: 8px 0; border-bottom: 1px solid #1f2937; }
-         li .thumb { max-width: 120px; max-height: 80px; object-fit: cover; border-radius: 6px; vertical-align: middle; margin-left: 6px; }
-         .badge { background: #1e40af; padding: 2px 6px; border-radius: 4px; font-size: 0.85em; }
-         .badge-muted { background: #374151; }
-         small { color: #9ca3af; }
-         code { background: #111827; padding: 2px 6px; border-radius: 4px; }
-       </style>
-     </head>
-     <body>
-       <h1>Teklif Talepleri Yönetimi</h1>
-       <p style="color:#94a3b8;margin-bottom:16px;">Sigorta chatbot üzerinden gelen araç sigortası teklif talepleri ve son mesajlar.</p>
-       <div class="card">
-         <p><strong>Son mesajlar</strong> (${conversations.length})</p>
-         <ul>${items || "<li>Henüz mesaj yok.</li>"}</ul>
-       </div>
-       <div class="card" style="margin-top:16px;">
-         <p><strong>Teklif talepleri</strong> (${leads.length})</p>
-         <ul>${leadItems || "<li>Henüz teklif talebi yok.</li>"}</ul>
-       </div>
-     </body>
-     </html>
-`);
- });
+  res.redirect(302, "/app/");
+});
 
  // Admin SPA (React): build with "cd admin-app && npm run build"
  const adminDist = path.join(__dirname, "admin-app", "dist");
@@ -368,7 +297,10 @@ function syncLeadFieldsFromRuhsat(ruhsatData) {
     if (parts.length >= 1) o.firstName = parts[0];
     if (parts.length >= 2) o.lastName = parts.slice(1).join(" ");
   }
-  if (ruhsatData.ruhsatSeriNo) o.ruhsatSeriNo = ruhsatData.ruhsatSeriNo;
+  if (ruhsatData.ruhsatSeriNo) {
+    const digits = String(ruhsatData.ruhsatSeriNo).replace(/\D/g, "");
+    o.ruhsatSeriNo = digits.length > 0 ? digits : ruhsatData.ruhsatSeriNo;
+  }
   if (ruhsatData.marka) o.marka = ruhsatData.marka;
   if (ruhsatData.tipi) o.model = ruhsatData.tipi;
   if (ruhsatData.modelYili) o.model = o.model ? `${o.model} ${ruhsatData.modelYili}` : String(ruhsatData.modelYili);
@@ -888,14 +820,16 @@ Sadece geçerli JSON döndür, markdown veya açıklama ekleme.
 
 ÖNEMLİ KURALLAR:
 - (E) ŞASE NO ile (P.5) MOTOR NO'yu asla karıştırma. Şase No (sasiNo) belgede (E) ŞASE NO yazan yerdeki 17 haneli VIN'dir (genelde NLH vb. harfle başlar). Motor No (motorNo) (P.5) MOTOR NO yazan yerdeki numaradır (örn. D4F ile başlayabilir). Her birini kendi alanından oku.
-- (Y.2) TESCİL SIRA NO'yu rakam rakam aynen kopyala; tek bir rakamı yanlış yazma.
+- (Y.2) TESCİL SIRA NO sadece rakamlardan oluşan uzun numaradır; rakam rakam aynen kopyala, boşluk/tire koyma. O harfi 0 (sıfır) değildir.
+- Belge Seri No (belgeSeriNo): Ruhsatın SAĞ tarafında, QR kodun (barkod) hemen ALTINDA yer alır. Orada \"belge seri:\" yazan yerde 2 harf (örn. hf) ve \"No\" yazan yerde 6 rakam (örn. 964933) vardır. Sadece bu 2 harf + 6 rakamı birleştir (örn. HF964933). Araya N veya başka karakter ekleme; (Y.2) Tescil Sıra No ile karıştırma.
 - marka SADECE (D.1) MARKASI olsun (örn. HYUNDAI). PBT, i20 gibi tip/ticari adı ekleme.
 
 {
   "plaka": "34KN5930 formatında",
   "tcKimlik": "11 haneli TC kimlik no",
   "sahibiAdiSoyadi": "Ad Soyad",
-  "ruhsatSeriNo": "(Y.2) TESCİL SIRA NO — tüm rakamları aynen",
+  "ruhsatSeriNo": "(Y.2) TESCİL SIRA NO — sadece rakamlar, boşluksuz (örn. 20240807102652626393)",
+  "belgeSeriNo": "Ruhsatın SAĞ tarafında QR kodun ALTINDA 'belge seri:' (2 harf) ve 'No' (6 rakam) alanı; sadece 2 harf + 6 rakam örn. HF964933",
   "marka": "SADECE (D.1) MARKASI, örn HYUNDAI (tip/ticari adı ekleme)",
   "tipi": "(D.2) TİPİ + (D.3) TİCARİ ADI (örn PBT, i20)",
   "modelYili": "örn 2013",
@@ -949,6 +883,26 @@ async function extractRuhsatFromImage(filePath) {
     const raw = data.choices?.[0]?.message?.content;
     if (!raw) return {};
     const parsed = JSON.parse(raw);
+
+    // Tescil Sıra No (Y.2): sadece rakamlar (karışan O/l vb. temizlenir)
+    if (parsed.ruhsatSeriNo) {
+      const digits = String(parsed.ruhsatSeriNo).replace(/\D/g, "");
+      parsed.ruhsatSeriNo = digits.length > 0 ? digits : parsed.ruhsatSeriNo;
+    }
+    // Belge Seri No: "belge seri: hf" (2 harf) + "No 964933" (6 rakam) → HF964933; araya N vb. eklenmez
+    if (parsed.belgeSeriNo) {
+      const s = String(parsed.belgeSeriNo).replace(/\s/g, "").toUpperCase();
+      const match = s.match(/^([A-Z]{2})(\d{6})$/);
+      if (match) {
+        parsed.belgeSeriNo = match[1] + match[2];
+      } else {
+        const letters = (s.match(/[A-Za-z]/g) || []).join("").toUpperCase().slice(0, 2);
+        const digits = (s.match(/\d/g) || []).join("").slice(0, 6);
+        if (letters.length === 2 && digits.length === 6) parsed.belgeSeriNo = letters + digits;
+        else delete parsed.belgeSeriNo;
+      }
+    }
+
     return Object.fromEntries(
       Object.entries(parsed).filter(([, v]) => v != null && String(v).trim() !== "" && v !== "null")
     );
@@ -1022,7 +976,8 @@ bot.on("photo", async (ctx) => {
   const guessedPlate = (ruhsatData.plaka && ruhsatData.plaka.trim()) ? ruhsatData.plaka.trim() : null;
 
   const ruhsatSummary = [];
-  if (ruhsatData.ruhsatSeriNo) ruhsatSummary.push(`Ruhsat No: ${ruhsatData.ruhsatSeriNo}`);
+  if (ruhsatData.ruhsatSeriNo) ruhsatSummary.push(`Tescil Sıra No: ${ruhsatData.ruhsatSeriNo}`);
+  if (ruhsatData.belgeSeriNo) ruhsatSummary.push(`Belge Seri No: ${ruhsatData.belgeSeriNo}`);
   if (ruhsatData.markaTip) ruhsatSummary.push(`Marka/Tip: ${ruhsatData.markaTip}`);
   if (ruhsatData.modelYili) ruhsatSummary.push(`Model Yılı: ${ruhsatData.modelYili}`);
   if (ruhsatData.kullanimTarzi || ruhsatData.kullanimAmaci) ruhsatSummary.push(`Kullanım: ${ruhsatData.kullanimTarzi || ruhsatData.kullanimAmaci}`);

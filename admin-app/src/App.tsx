@@ -6,6 +6,7 @@ const API_BASE = ''
 type RuhsatData = {
   plaka?: string
   ruhsatSeriNo?: string
+  belgeSeriNo?: string
   tescilTarihi?: string
   trafigeCikisTarihi?: string
   tcKimlik?: string
@@ -284,7 +285,8 @@ function LeadDetailModal({
   const marka = lead.marka ?? lead.ruhsatData?.markaTip ?? lead.ruhsatData?.marka ?? lead.markaKm ?? '—'
   const model = lead.model ?? lead.ruhsatData?.tipi ?? lead.ruhsatData?.modelYili ?? '—'
   const km = lead.km ?? '—'
-  const ruhsatSeriNo = lead.ruhsatSeriNo ?? lead.ruhsatData?.ruhsatSeriNo ?? '—'
+  const tescilSiraNo = lead.ruhsatSeriNo ?? lead.ruhsatData?.ruhsatSeriNo ?? '—'
+  const belgeSeriNo = lead.ruhsatData?.belgeSeriNo ?? '—'
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -304,7 +306,8 @@ function LeadDetailModal({
               <dt>Marka</dt><dd>{marka}</dd>
               <dt>Model</dt><dd>{model}</dd>
               <dt>KM</dt><dd>{km}</dd>
-              <dt>Ruhsat Seri No</dt><dd><code>{ruhsatSeriNo}</code></dd>
+              <dt>Tescil Sıra No</dt><dd><code>{tescilSiraNo}</code></dd>
+              <dt>Belge Seri No</dt><dd><code>{belgeSeriNo}</code></dd>
               <dt>Kullanım</dt><dd>{lead.ruhsatData?.kullanimTarzi ?? lead.ruhsatData?.kullanimAmaci ?? '—'}</dd>
               <dt>Paket</dt><dd>{lead.packageChoice ?? '—'}</dd>
               <dt>Durum</dt><dd>{STATUS_LABELS[lead.status] ?? lead.status}</dd>
@@ -905,7 +908,8 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
                           <div><dt>Marka</dt><dd>{row.marka ?? row.ruhsatData?.markaTip ?? row.ruhsatData?.marka ?? row.markaKm ?? '—'}</dd></div>
                           <div><dt>Model</dt><dd>{row.model ?? row.ruhsatData?.tipi ?? '—'}</dd></div>
                           <div><dt>KM</dt><dd>{row.km ?? '—'}</dd></div>
-                          <div><dt>Ruhsat Seri No</dt><dd>{row.ruhsatSeriNo ?? row.ruhsatData?.ruhsatSeriNo ?? '—'}</dd></div>
+                          <div><dt>Tescil Sıra No</dt><dd>{row.ruhsatSeriNo ?? row.ruhsatData?.ruhsatSeriNo ?? '—'}</dd></div>
+                          <div><dt>Belge Seri No</dt><dd>{row.ruhsatData?.belgeSeriNo ?? '—'}</dd></div>
                         </dl>
                         <div className="lead-card-actions">
                           <button type="button" className="lead-btn lead-btn-primary" onClick={() => { setDetailLead(row); setQuotePrice(row.offeredPrice != null ? String(row.offeredPrice) : ''); setQuoteError(''); }}>
