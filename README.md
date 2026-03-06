@@ -36,6 +36,10 @@ Araç sigortası teklifi almak için Telegram botu ve yönetim paneli. Müşteri
 - **Veritabanı:** `data/sigorta.db` yerel SQLite dosyasıdır; genelde `.gitignore` ile takip dışı bırakılır. İsterseniz sadece şema için `database/schema.sql` gibi bir dosya tutup yeni ortamlarda veritabanını oradan oluşturabilirsiniz.
 - **Geliştirme:** Backend’de değişiklik için `npm run dev` (nodemon) kullanılabilir. Frontend değişikliği için `admin-app` içinde `npm run dev` ile canlı yenileme açılabilir.
 
+## UI geliştirme (Figma MCP)
+
+Admin arayüzünü Figma’da taslayıp Cursor’da tasarımdan koda dönüştürmek için **Figma MCP** kullanılabilir (ücretsiz). Kurulum ve kullanım: **[FIGMA_MCP.md](FIGMA_MCP.md)**.
+
 ## Klasör yapısı
 
 - `index.js` — Express API + Telegram bot (Telegraf), OCR (Tesseract)

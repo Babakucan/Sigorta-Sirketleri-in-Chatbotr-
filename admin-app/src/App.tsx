@@ -83,6 +83,26 @@ function formatDate(ts: number) {
   return new Date(ts).toLocaleString('tr-TR')
 }
 
+function formatRelativeTime(ts: number): string {
+  const now = Date.now()
+  const d = new Date(ts)
+  const diffMs = now - ts
+  const diffDays = Math.floor(diffMs / (24 * 60 * 60 * 1000))
+  if (diffDays === 0) {
+    const diffHours = Math.floor(diffMs / (60 * 60 * 1000))
+    if (diffHours === 0) {
+      const diffMins = Math.floor(diffMs / (60 * 1000))
+      if (diffMins < 1) return 'Az önce'
+      if (diffMins < 60) return `${diffMins} dk önce`
+    }
+    return diffHours < 1 ? '1 saatten az' : `${diffHours} saat önce`
+  }
+  if (diffDays === 1) return 'Dün'
+  if (diffDays < 7) return `${diffDays} gün önce`
+  if (diffDays < 14) return '1 hafta önce'
+  return d.toLocaleDateString('tr-TR', { day: 'numeric', month: 'short', year: d.getFullYear() !== new Date().getFullYear() ? 'numeric' : undefined })
+}
+
 function useApi(token: string | null) {
   const headers = (): HeadersInit => {
     if (!token) return {}
@@ -266,20 +286,22 @@ function LeadDetailModal({
               {lead.ruhsatData?.motorNo && <><dt>Motor no</dt><dd><code>{lead.ruhsatData.motorNo}</code></dd></>}
             </dl>
             <h4 style={{ marginTop: '1rem' }}>Teklif fiyatı & gönder</h4>
-            <label>
-              Teklif fiyatı (TL)
+            <label className="quote-price-label">Teklif fiyatı (TL)</label>
+            <div className="quote-price-row">
               <input
                 type="text"
                 inputMode="decimal"
+                className="quote-price-input"
                 value={quotePrice}
                 onChange={(e) => setQuotePrice(e.target.value)}
                 placeholder="Örn: 12500"
+                aria-label="Teklif fiyatı TL"
               />
-            </label>
+              <button type="button" className="btn-send-quote" onClick={onSendQuote} disabled={sendingQuote}>
+                {sendingQuote ? 'Gönderiliyor…' : 'Müşteriye Gönder'}
+              </button>
+            </div>
             {quoteError && <p className="error">{quoteError}</p>}
-            <button type="button" className="btn-send-quote" onClick={onSendQuote} disabled={sendingQuote}>
-              {sendingQuote ? 'Gönderiliyor…' : 'Müşteriye Gönder'}
-            </button>
           </div>
           <div className="detail-photo-col">
             <h4>Ruhsat fotoğrafı</h4>
@@ -566,7 +588,7 @@ function PackagesView({
   )
 }
 
-function Dashboard({ token, onLogout }: { token: string; onLogout: () => void }) {
+function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogout: () => void; theme: 'light' | 'dark'; setTheme: (t: 'light' | 'dark') => void }) {
   const { fetchLeads, fetchConversations, fetchPackages, savePackages, sendLeadQuote, getLeadPhotoUrl } = useApi(token)
   const [leads, setLeads] = useState<Lead[]>([])
   const [conversations, setConversations] = useState<Conversation[]>([])
@@ -584,6 +606,50 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   const [sendingQuote, setSendingQuote] = useState(false)
   const [quoteError, setQuoteError] = useState('')
   const [packagesSaveSuccess, setPackagesSaveSuccess] = useState(false)
+  const [leadDateFrom, setLeadDateFrom] = useState('')
+  const [leadDateTo, setLeadDateTo] = useState('')
+  const [leadSearch, setLeadSearch] = useState('')
+
+  const filteredLeads = useMemo(() => {
+    let list = leads
+    if (leadDateFrom) {
+      const from = new Date(leadDateFrom)
+      from.setHours(0, 0, 0, 0)
+      list = list.filter((l) => l.createdAt >= from.getTime())
+    }
+    if (leadDateTo) {
+      const to = new Date(leadDateTo)
+      to.setHours(23, 59, 59, 999)
+      list = list.filter((l) => l.createdAt <= to.getTime())
+    }
+    const q = leadSearch.trim().toLowerCase()
+    if (q) {
+      list = list.filter((l) => {
+        const isim = (l.firstName ?? l.ruhsatData?.sahibiAdiSoyadi?.split(/\s+/)[0] ?? '').toLowerCase()
+        const soyisim = (l.lastName ?? l.ruhsatData?.sahibiAdiSoyadi?.split(/\s+/).slice(1).join(' ') ?? '').toLowerCase()
+        const plaka = (l.plate ?? l.ruhsatData?.plaka ?? '').toLowerCase().replace(/\s/g, '')
+        const tc = (l.tc ?? l.ruhsatData?.tcKimlik ?? '').replace(/\s/g, '')
+        const marka = (l.marka ?? l.ruhsatData?.markaTip ?? l.ruhsatData?.marka ?? l.markaKm ?? '').toLowerCase()
+        const model = (l.model ?? l.ruhsatData?.tipi ?? '').toLowerCase()
+        const ruhsat = (l.ruhsatSeriNo ?? l.ruhsatData?.ruhsatSeriNo ?? '').toLowerCase()
+        const searchNorm = q.replace(/\s/g, '')
+        return (
+          isim.includes(q) || soyisim.includes(q) ||
+          (plaka && plaka.includes(searchNorm)) ||
+          (tc && tc.includes(searchNorm)) ||
+          marka.includes(q) || model.includes(q) ||
+          ruhsat.includes(q)
+        )
+      })
+    }
+    return list
+  }, [leads, leadDateFrom, leadDateTo, leadSearch])
+  const fiyatBekleyenCount = useMemo(() => leads.filter((l) => l.status === 'fiyat_bekleniyor').length, [leads])
+
+  const setDateRange = useCallback((from: string, to: string) => {
+    setLeadDateFrom(from)
+    setLeadDateTo(to)
+  }, [])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -687,7 +753,8 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
     <div className="dashboard">
       <header>
         <h1>Sigorta Admin</h1>
-        <div>
+        <div className="header-actions">
+          <ThemeToggle theme={theme} setTheme={setTheme} />
           <button type="button" onClick={load} disabled={loading}>Yenile</button>
           <button type="button" onClick={() => onLogout()} className="outline">Çıkış</button>
         </div>
@@ -701,54 +768,104 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
       {loading ? (
         <p>Yükleniyor…</p>
       ) : tab === 'leads' ? (
-        <div className="table-wrap">
-          <p className="muted" style={{ marginBottom: '0.5rem' }}>Tüm teklif talepleri tarih sırasıyla listelenir.</p>
-          <table>
-            <thead>
-              <tr>
-                <th>İsim</th>
-                <th>Soyisim</th>
-                <th>Plaka</th>
-                <th>TC</th>
-                <th>Marka</th>
-                <th>Model</th>
-                <th>KM</th>
-                <th>Ruhsat Seri No</th>
-                <th>Durum</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {leads.map((row) => {
-                const isim = row.firstName ?? row.ruhsatData?.sahibiAdiSoyadi?.split(/\s+/)[0] ?? '—'
-                const soyisim = row.lastName ?? row.ruhsatData?.sahibiAdiSoyadi?.split(/\s+/).slice(1).join(' ') ?? '—'
-                return (
-                  <tr key={row.id}>
-                    <td>{isim}</td>
-                    <td>{soyisim}</td>
-                    <td className="cell-plate">{row.plate ?? row.ruhsatData?.plaka ?? '—'}</td>
-                    <td className="cell-tc">{row.tc ?? row.ruhsatData?.tcKimlik ?? '—'}</td>
-                    <td>{row.marka ?? row.ruhsatData?.markaTip ?? row.ruhsatData?.marka ?? row.markaKm ?? '—'}</td>
-                    <td>{row.model ?? row.ruhsatData?.tipi ?? '—'}</td>
-                    <td>{row.km ?? '—'}</td>
-                    <td className="cell-ruhsat-no">{row.ruhsatSeriNo ?? row.ruhsatData?.ruhsatSeriNo ?? '—'}</td>
-                    <td className={row.status === 'fiyat_bekleniyor' ? 'status-fiyat-bekleniyor' : ''}>
-                      {row.status === 'fiyat_bekleniyor' ? 'Fiyat Bekleniyor' : (STATUS_LABELS[row.status] ?? row.status)}
-                    </td>
-                    <td>
-                      <button type="button" className="btn-detay" onClick={() => { setDetailLead(row); setQuotePrice(row.offeredPrice != null ? String(row.offeredPrice) : ''); setQuoteError(''); }}>
-                        Detay
-                      </button>
-                      <button type="button" className="btn-mesajlar" onClick={() => { setConversationChatId(row.chatId); setTab('conversations'); }}>
-                        Mesajlar
-                      </button>
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-          {leads.length === 0 && <p>Henüz teklif yok.</p>}
+        <div className="leads-view">
+          {leads.length === 0 ? (
+            <p className="leads-empty">Henüz teklif yok.</p>
+          ) : (
+            <>
+              <div className="leads-view-bar">
+                <p className="leads-view-summary">
+                  <strong>{leads.length}</strong> teklif
+                  {fiyatBekleyenCount > 0 && (
+                    <> · <strong className="leads-view-pending">{fiyatBekleyenCount}</strong> fiyat bekliyor</>
+                  )}
+                  {filteredLeads.length !== leads.length && (
+                    <> · gösterilen: <strong>{filteredLeads.length}</strong></>
+                  )}
+                </p>
+                <div className="leads-view-filters-row">
+                  <label className="leads-view-date-group">
+                    <span className="leads-view-date-label">Başlangıç</span>
+                    <input
+                      type="date"
+                      className="leads-view-date"
+                      value={leadDateFrom}
+                      onChange={(e) => setLeadDateFrom(e.target.value)}
+                      aria-label="Başlangıç tarihi"
+                    />
+                  </label>
+                  <label className="leads-view-date-group">
+                    <span className="leads-view-date-label">Bitiş</span>
+                    <input
+                      type="date"
+                      className="leads-view-date"
+                      value={leadDateTo}
+                      onChange={(e) => setLeadDateTo(e.target.value)}
+                      aria-label="Bitiş tarihi"
+                    />
+                  </label>
+                  <div className="leads-view-date-presets">
+                    <button type="button" className={!leadDateFrom && !leadDateTo ? 'active' : ''} onClick={() => setDateRange('', '')}>Tümü</button>
+                    <button type="button" onClick={() => { const d = new Date(); const s = d.toISOString().slice(0, 10); setDateRange(s, s); }}>Bugün</button>
+                    <button type="button" onClick={() => { const d = new Date(); const end = d.toISOString().slice(0, 10); d.setDate(d.getDate() - 6); const start = d.toISOString().slice(0, 10); setDateRange(start, end); }}>Bu hafta</button>
+                    <button type="button" onClick={() => { const d = new Date(); const end = d.toISOString().slice(0, 10); d.setDate(1); const start = d.toISOString().slice(0, 10); setDateRange(start, end); }}>Bu ay</button>
+                  </div>
+                  <input
+                    type="search"
+                    className="leads-view-search"
+                    placeholder="İsim, plaka, marka..."
+                    value={leadSearch}
+                    onChange={(e) => setLeadSearch(e.target.value)}
+                    aria-label="Ara"
+                  />
+                </div>
+              </div>
+              {filteredLeads.length === 0 ? (
+                <p className="leads-empty">Bu filtreye uyan teklif yok.</p>
+              ) : (
+                <div className="leads-grid">
+                  {filteredLeads.map((row) => {
+                    const isim = row.firstName ?? row.ruhsatData?.sahibiAdiSoyadi?.split(/\s+/)[0] ?? '—'
+                    const soyisim = row.lastName ?? row.ruhsatData?.sahibiAdiSoyadi?.split(/\s+/).slice(1).join(' ') ?? '—'
+                    const fullName = [isim, soyisim].filter(Boolean).join(' ').trim() || '—'
+                    const initial = (isim?.[0] ?? soyisim?.[0] ?? '?').toUpperCase()
+                    const plaka = row.plate ?? row.ruhsatData?.plaka ?? '—'
+                    const statusLabel = row.status === 'fiyat_bekleniyor' ? 'Fiyat Bekleniyor' : (STATUS_LABELS[row.status] ?? row.status)
+                    return (
+                      <article key={row.id} className="lead-card">
+                        <div className="lead-card-header">
+                          <span className="lead-card-avatar">{initial}</span>
+                          <div className="lead-card-title-wrap">
+                            <span className="lead-card-name">{fullName}</span>
+                            <span className="lead-card-plaka">{plaka}</span>
+                            <span className="lead-card-date" title={formatDate(row.createdAt)}>{formatRelativeTime(row.createdAt)}</span>
+                          </div>
+                          <span className={`lead-card-status ${row.status === 'fiyat_bekleniyor' ? 'lead-card-status-warning' : ''}`}>
+                            {statusLabel}
+                          </span>
+                        </div>
+                        <dl className="lead-card-fields">
+                          <div><dt>TC</dt><dd>{row.tc ?? row.ruhsatData?.tcKimlik ?? '—'}</dd></div>
+                          <div><dt>Marka</dt><dd>{row.marka ?? row.ruhsatData?.markaTip ?? row.ruhsatData?.marka ?? row.markaKm ?? '—'}</dd></div>
+                          <div><dt>Model</dt><dd>{row.model ?? row.ruhsatData?.tipi ?? '—'}</dd></div>
+                          <div><dt>KM</dt><dd>{row.km ?? '—'}</dd></div>
+                          <div><dt>Ruhsat Seri No</dt><dd>{row.ruhsatSeriNo ?? row.ruhsatData?.ruhsatSeriNo ?? '—'}</dd></div>
+                        </dl>
+                        <div className="lead-card-actions">
+                          <button type="button" className="lead-btn lead-btn-primary" onClick={() => { setDetailLead(row); setQuotePrice(row.offeredPrice != null ? String(row.offeredPrice) : ''); setQuoteError(''); }}>
+                            Detay
+                          </button>
+                          <button type="button" className="lead-btn lead-btn-secondary" onClick={() => { setConversationChatId(row.chatId); setTab('conversations'); }}>
+                            Mesajlar
+                          </button>
+                        </div>
+                      </article>
+                    )
+                  })}
+                </div>
+              )}
+            </>
+          )}
         </div>
       ) : tab === 'conversations' ? (
         <ConversationsView conversations={conversations} formatDate={formatDate} initialChatId={conversationChatId} />
@@ -784,18 +901,55 @@ function Dashboard({ token, onLogout }: { token: string; onLogout: () => void })
   )
 }
 
+const THEME_KEY = 'admin-theme'
+type Theme = 'light' | 'dark'
+
+function ThemeToggle({ theme, setTheme }: { theme: Theme; setTheme: (t: Theme) => void }) {
+  return (
+    <div className="theme-toggle" role="group" aria-label="Tema">
+      <button
+        type="button"
+        className={theme === 'light' ? 'active' : ''}
+        onClick={() => setTheme('light')}
+        title="Açık tema"
+      >
+        Açık
+      </button>
+      <button
+        type="button"
+        className={theme === 'dark' ? 'active' : ''}
+        onClick={() => setTheme('dark')}
+        title="Koyu tema"
+      >
+        Koyu
+      </button>
+    </div>
+  )
+}
+
 export default function App() {
   const [token, setToken] = useState<string | null>(() => sessionStorage.getItem('adminToken'))
+  const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem(THEME_KEY) as Theme) || 'dark')
 
   useEffect(() => {
     if (token) sessionStorage.setItem('adminToken', token)
     else sessionStorage.removeItem('adminToken')
   }, [token])
 
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem(THEME_KEY, theme)
+  }, [theme])
+
   return (
     <div id="app">
+      {!token && (
+        <div className="theme-toggle-wrap">
+          <ThemeToggle theme={theme} setTheme={setTheme} />
+        </div>
+      )}
       {token ? (
-        <Dashboard token={token} onLogout={() => setToken(null)} />
+        <Dashboard token={token} onLogout={() => setToken(null)} theme={theme} setTheme={setTheme} />
       ) : (
         <Login onLogin={setToken} />
       )}
