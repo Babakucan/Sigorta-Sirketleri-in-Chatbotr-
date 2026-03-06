@@ -1,11 +1,13 @@
-const express = require("express");
 const path = require("path");
 const fs = require("fs");
-const dotenv = require("dotenv");
+const { OPENAI_API_KEY } = require("./config.js");
+
+require("dotenv").config({ path: path.join(__dirname, ".env") });
+if (OPENAI_API_KEY) console.log("OPENAI_API_KEY: yüklendi (ruhsat AI aktif)");
+
+const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
 const { getLeads, getLeadById, insertLead, updateLead, getConversations, addConversation, getPackages, updatePackage, insertPackage } = require("./db");
-
-dotenv.config();
 
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) {
@@ -213,6 +215,19 @@ app.post("/api/leads/:id/reparse-ruhsat", apiAuth, async (req, res) => {
   }
 });
 
+app.patch("/api/leads/:id", apiAuth, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ error: "Geçersiz teklif ID." });
+  const lead = getLeadById(id);
+  if (!lead) return res.status(404).json({ error: "Teklif bulunamadı." });
+  const { km, packageChoice } = req.body || {};
+  const updates = {};
+  if (km !== undefined) updates.km = km == null || String(km).trim() === "" ? null : String(km).trim();
+  if (packageChoice !== undefined) updates.packageChoice = packageChoice == null || String(packageChoice).trim() === "" ? null : String(packageChoice).trim();
+  if (Object.keys(updates).length) updateLead(id, updates);
+  res.json(getLeadById(id));
+});
+
 // Serve uploaded photos only for admin (secret required by middleware)
 app.get("/admin/photo/:filename", (req, res) => {
   const raw = req.params.filename;
@@ -354,10 +369,11 @@ function syncLeadFieldsFromRuhsat(ruhsatData) {
     if (parts.length >= 2) o.lastName = parts.slice(1).join(" ");
   }
   if (ruhsatData.ruhsatSeriNo) o.ruhsatSeriNo = ruhsatData.ruhsatSeriNo;
-  if (ruhsatData.markaTip || ruhsatData.marka) o.marka = ruhsatData.markaTip || ruhsatData.marka;
+  if (ruhsatData.marka) o.marka = ruhsatData.marka;
   if (ruhsatData.tipi) o.model = ruhsatData.tipi;
   if (ruhsatData.modelYili) o.model = o.model ? `${o.model} ${ruhsatData.modelYili}` : String(ruhsatData.modelYili);
   if (ruhsatData.plaka && String(ruhsatData.plaka).replace(/\s/g, "").length >= 5) o.plate = String(ruhsatData.plaka).replace(/\s/g, "").toUpperCase().trim();
+  if (ruhsatData.km != null && String(ruhsatData.km).trim()) o.km = String(ruhsatData.km).replace(/\D/g, "").trim() || null;
   return o;
 }
 
@@ -775,66 +791,22 @@ bot.on("text", async (ctx) => {
       await ctx.reply(reply);
       return;
     } else {
-      const kmMatch = markaKm.match(/(\d+)\s*km?/i);
-      const km = kmMatch ? kmMatch[1] : null;
-      const marka = kmMatch ? markaKm.replace(/\d+\s*km?/i, "").trim() : markaKm;
-      const updates = { markaKm, status: "awaiting_package" };
+      // 45000 km, 125.000 km, 45000 kilometre, veya sadece 45000 (4–6 rakam)
+      const kmWithUnit = markaKm.match(/(\d[\d.\s]*?)\s*(?:km|kilometre)\s*$/i);
+      const kmOnly = markaKm.match(/\b(\d{4,6})\s*$/);
+      const kmMatch = kmWithUnit || kmOnly;
+      const kmRaw = kmMatch ? String(kmMatch[1]).replace(/[\s.]/g, "") : null;
+      const km = kmRaw && /^\d+$/.test(kmRaw) ? kmRaw : null;
+      const marka = kmMatch ? markaKm.replace(kmMatch[0], "").trim() : markaKm;
+      const updates = { markaKm, status: "fiyat_bekleniyor" };
       if (marka) updates.marka = marka;
       if (km) updates.km = km;
       updateLead(lead.id, updates);
-      setChatState(chatId, { mode: "ask_package", leadId: lead.id });
-      const reply =
-        "Bilgileriniz için teşekkürler. Size en uygun teklifi hazırlayabilmemiz için hangi kapsamda bir koruma istersiniz?";
-      addMessage(chatId, "bot", reply);
-      await ctx.reply(reply, packageInlineKeyboard());
-      return;
-    }
-  }
-
-  if (state && state.mode === "ask_package") {
-    const choice = userText.trim().toLowerCase();
-    const lead = findLeadById(state.leadId);
-    if (!lead) {
-      setChatState(chatId, null);
-    } else if (["detay", "detaylar", "kapsam"].includes(choice)) {
-      const pkgs = getPackages();
-      const reply =
-        pkgs.map((p) => `${p.name}: ${p.description}`).join("\n\n") +
-        "\n\nHangi kapsamda koruma istersiniz? Aşağıdaki butonlardan seçin.";
-      addMessage(chatId, "bot", reply);
-      await ctx.reply(reply, packageInlineKeyboard());
-      return;
-    } else if (["beni ara", "ara", "arayın", "geri arama"].includes(choice)) {
-      lead.packageChoice = "Beni Ara";
-      lead.status = "completed";
-      updateLead(lead.id, { packageChoice: "Beni Ara", status: "completed" });
       setChatState(chatId, null);
       const reply =
-        "Talebiniz alındı. Temsilcimiz en kısa sürede sizi arayıp size özel fiyat ve indirim seçeneklerini sunacaktır.";
+        "Bilgileriniz alındı. Teklifiniz hazırlanacak; en kısa sürede size dönüş yapacağız.";
       addMessage(chatId, "bot", reply);
       await ctx.reply(reply);
-      return;
-    } else {
-      const pkgs = getPackages();
-      const ekoPkg = pkgs.find((p) => p.key === "pkg_eko");
-      const genisPkg = pkgs.find((p) => p.key === "pkg_genis");
-      const fullPkg = pkgs.find((p) => p.key === "pkg_full");
-      let chosen = null;
-      if (["eko", "ekonomik", "1"].includes(choice) && ekoPkg) chosen = ekoPkg.name;
-      else if (["genişletilmiş", "geniş", "standart", "önerilen", "2"].includes(choice) && genisPkg) chosen = genisPkg.name;
-      else if (["full", "full kapsam", "tam", "3"].includes(choice) && fullPkg) chosen = fullPkg.name;
-      if (chosen) {
-        lead.packageChoice = chosen;
-        updateLead(lead.id, { packageChoice: chosen, status: "fiyat_bekleniyor" });
-        setChatState(chatId, null);
-        const reply = "Tercihiniz kaydedildi. Teklifiniz hazırlanıyor; en kısa sürede size dönüş yapacağız.";
-        addMessage(chatId, "bot", reply);
-        await ctx.reply(reply);
-        return;
-      }
-      const reply = "Lütfen aşağıdaki butonlardan birini seçin veya Ekonomik / Standart / Full Kapsam / Beni Ara yazın.";
-      addMessage(chatId, "bot", reply);
-      await ctx.reply(reply, packageInlineKeyboard());
       return;
     }
   }
@@ -910,32 +882,37 @@ async function sendPackageCompletion(ctx, chatId, lead, pkg) {
 }
 
 /** Ruhsat fotoğrafından AI görsel analiz ile bilgileri çıkarır (OpenAI Vision API) */
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const RUHSAT_PROMPT = `Bu görsel Türkiye Trafik Tescil Belgesi (ruhsat) fotoğrafıdır.
 Aşağıdaki JSON anahtarlarına göre gördüğün tüm bilgileri çıkar. Bulamadığın alan için null kullan.
 Sadece geçerli JSON döndür, markdown veya açıklama ekleme.
+
+ÖNEMLİ KURALLAR:
+- (E) ŞASE NO ile (P.5) MOTOR NO'yu asla karıştırma. Şase No (sasiNo) belgede (E) ŞASE NO yazan yerdeki 17 haneli VIN'dir (genelde NLH vb. harfle başlar). Motor No (motorNo) (P.5) MOTOR NO yazan yerdeki numaradır (örn. D4F ile başlayabilir). Her birini kendi alanından oku.
+- (Y.2) TESCİL SIRA NO'yu rakam rakam aynen kopyala; tek bir rakamı yanlış yazma.
+- marka SADECE (D.1) MARKASI olsun (örn. HYUNDAI). PBT, i20 gibi tip/ticari adı ekleme.
 
 {
   "plaka": "34KN5930 formatında",
   "tcKimlik": "11 haneli TC kimlik no",
   "sahibiAdiSoyadi": "Ad Soyad",
-  "ruhsatSeriNo": "TESCİL SIRA NO veya Ruhsat Seri No",
-  "marka": "örn HYUNDAI",
-  "tipi": "örn PBT, 120",
+  "ruhsatSeriNo": "(Y.2) TESCİL SIRA NO — tüm rakamları aynen",
+  "marka": "SADECE (D.1) MARKASI, örn HYUNDAI (tip/ticari adı ekleme)",
+  "tipi": "(D.2) TİPİ + (D.3) TİCARİ ADI (örn PBT, i20)",
   "modelYili": "örn 2013",
-  "markaTip": "marka + tip birleşik",
+  "markaTip": "tip + ticari adı (D.2 + D.3), marka değil",
   "kullanimTarzi": "örn OTOMOBİL (AF ÇOK AMAÇLI)",
   "kullanimAmaci": "kullanım amacı",
   "tescilTarihi": "gg/aa/yyyy",
-  "sasiNo": "17 haneli VIN",
-  "motorNo": "motor no",
-  "renk": "örn BEYAZ"
+  "sasiNo": "SADECE (E) ŞASE NO alanındaki 17 haneli VIN",
+  "motorNo": "SADECE (P.5) MOTOR NO alanındaki numara",
+  "renk": "örn BEYAZ",
+  "km": "belgede km yazıyorsa sadece sayı, yoksa null"
 }`;
 
 async function extractRuhsatFromImage(filePath) {
   if (!filePath || !fs.existsSync(filePath)) return {};
   if (!OPENAI_API_KEY) {
-    console.warn("OPENAI_API_KEY tanımlı değil, ruhsat AI analizi atlanıyor.");
+    console.warn("OPENAI_API_KEY .env içinde boş veya yok; ruhsat AI atlanıyor. .env dosyasına OPENAI_API_KEY=sk-... ekleyin.");
     return {};
   }
   try {
@@ -950,7 +927,7 @@ async function extractRuhsatFromImage(filePath) {
         "Authorization": `Bearer ${OPENAI_API_KEY}`,
       },
       body: JSON.stringify({
-        model: "gpt-4o",
+        model: "gpt-4o-mini",
         max_tokens: 1024,
         messages: [
           {
@@ -1027,9 +1004,10 @@ bot.on("photo", async (ctx) => {
     });
   }
 
-  // Ruhsat AI analiz: sigorta için gerekli tüm alanları çek (TRAMER, risk analizi)
+  // Ruhsat AI analiz: varsayılan açık. RUHSAT_AI_ON_PHOTO=false yaparsanız fotoğrafta çağrılmaz (sadece admin "Ruhsattan tekrar oku" ile)
   let ruhsatData = {};
-  if (savedPath) {
+  const aiOnPhoto = process.env.RUHSAT_AI_ON_PHOTO !== "false" && process.env.RUHSAT_AI_ON_PHOTO !== "0";
+  if (savedPath && aiOnPhoto) {
     try {
       ruhsatData = await extractRuhsatFromImage(savedPath) || {};
       if (Object.keys(ruhsatData).length > 0) {

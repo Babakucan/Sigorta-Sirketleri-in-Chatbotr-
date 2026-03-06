@@ -554,6 +554,28 @@ button.outline:hover { background: var(--surface-hover); color: var(--text); bor
 .detail-form-dl { display: grid; grid-template-columns: auto 1fr; gap: 0.35rem 1rem; margin: 0 0 1rem; font-size: 0.9rem; color: var(--text); }
 .detail-form-dl dt { color: var(--muted); }
 .detail-form-dl dd { margin: 0; }
+.detail-edit-km, .detail-edit-package {
+  width: 100%;
+  max-width: 200px;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.9rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--input-bg);
+  color: var(--text);
+}
+.detail-km-pkg-actions { margin-top: 0.25rem; }
+.btn-save-km-pkg {
+  padding: 0.4rem 0.75rem;
+  font-size: 0.85rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+.btn-save-km-pkg:hover:not(:disabled) { background: var(--input-bg); }
+.btn-save-km-pkg:disabled { opacity: 0.7; cursor: not-allowed; }
 .detail-form-dl code {
   background: transparent;
   color: inherit;

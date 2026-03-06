@@ -210,7 +210,19 @@ function useApi(token: string | null) {
     return res.json()
   }, [token])
 
-  return { fetchLeads, fetchConversations, fetchPackages, savePackages, createPackage, sendLeadQuote, getLeadPhotoUrl, reparseRuhsat }
+  const updateLead = useCallback(async (leadId: number, updates: { km?: string | null; packageChoice?: string | null }): Promise<Lead> => {
+    if (!token) throw new Error('Unauthorized')
+    const res = await fetch(`${API_BASE}/api/leads/${leadId}`, {
+      method: 'PATCH',
+      headers: { ...headers(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    })
+    if (res.status === 401) throw new Error('SESSION_EXPIRED')
+    if (!res.ok) throw new Error('Güncellenemedi')
+    return res.json()
+  }, [token])
+
+  return { fetchLeads, fetchConversations, fetchPackages, savePackages, createPackage, sendLeadQuote, getLeadPhotoUrl, reparseRuhsat, updateLead }
 }
 
 function LeadDetailModal({
