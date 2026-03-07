@@ -225,7 +225,7 @@ function useApi(token: string | null) {
     return res.json()
   }, [token])
 
-  type Settings = { mesai_baslangic: string; mesai_bitis: string; mesai_gunler: string; mesaj_hemen_mesai_ici?: string; mesaj_hemen_mesai_dis?: string; mesaj_ozel_tarih_istek?: string; mesaj_ozel_tarih_onay?: string }
+  type Settings = { mesai_baslangic: string; mesai_bitis: string; mesai_gunler: string; mesaj_hemen_mesai_ici?: string; mesaj_hemen_mesai_dis?: string; mesaj_ozel_tarih_istek?: string; mesaj_ozel_tarih_onay?: string; conversation_saklama_gunu?: string }
   const fetchSettings = useCallback(async (): Promise<Settings> => {
     if (!token) throw new Error('Unauthorized')
     const res = await fetch(`${API_BASE}/api/settings`, { headers: headers() })
@@ -698,6 +698,7 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
   const [mesajHemenMesaiDis, setMesajHemenMesaiDis] = useState('')
   const [mesajOzelTarihIstek, setMesajOzelTarihIstek] = useState('')
   const [mesajOzelTarihOnay, setMesajOzelTarihOnay] = useState('')
+  const [conversationSaklamaGunu, setConversationSaklamaGunu] = useState('30')
 
   const filteredLeads = useMemo(() => {
     let list = leads
@@ -883,6 +884,7 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
         setMesajHemenMesaiDis(hemenDis)
         setMesajOzelTarihIstek(ozelIstek)
         setMesajOzelTarihOnay(s.mesaj_ozel_tarih_onay ?? '')
+        setConversationSaklamaGunu(s.conversation_saklama_gunu ?? '30')
       })
       .catch(() => setSettingsSaveError('Ayarlar yüklenemedi'))
       .finally(() => setSettingsLoading(false))
@@ -900,6 +902,7 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
         mesaj_hemen_mesai_dis: mesajHemenMesaiDis,
         mesaj_ozel_tarih_istek: mesajOzelTarihIstek,
         mesaj_ozel_tarih_onay: mesajOzelTarihOnay,
+        conversation_saklama_gunu: conversationSaklamaGunu,
       })
       setSettingsSaveSuccess(true)
       setTimeout(() => setSettingsSaveSuccess(false), 3000)
@@ -1117,6 +1120,20 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
                         </label>
                       ))}
                     </div>
+                  </div>
+                  <button type="button" className="lead-btn lead-btn-primary settings-card-save" onClick={handleSaveSettings}>Kaydet</button>
+                </div>
+              </article>
+
+              <article className="settings-card">
+                <header className="settings-card-header">
+                  <h2>Telegram sohbet temizliği</h2>
+                  <p className="settings-card-desc">Sadece Telegram uygulamasındaki mesajlar bu süre sonra silinir. Veritabanı ve admin paneldeki konuşmalar her zaman saklanır. 0 = silme yok.</p>
+                </header>
+                <div className="settings-card-body">
+                  <div className="settings-field">
+                    <label className="settings-field-label">Telegram'da mesaj silme süresi (gün)</label>
+                    <input type="number" min={0} max={365} value={conversationSaklamaGunu} onChange={(e) => setConversationSaklamaGunu(e.target.value)} placeholder="30" className="settings-time-input" style={{ maxWidth: '120px' }} />
                   </div>
                   <button type="button" className="lead-btn lead-btn-primary settings-card-save" onClick={handleSaveSettings}>Kaydet</button>
                 </div>
