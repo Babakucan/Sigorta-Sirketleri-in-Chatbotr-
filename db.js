@@ -96,6 +96,7 @@ const defaultSettings = [
   { key: "mesaj_hemen_mesai_dis", value: "Üzgünüz, şu anda mesai saatleri içinde değiliz. {mesaiAraligi} aralığında Özel tarih seçerek aranma zamanı oluşturabilirsiniz." },
   { key: "mesaj_ozel_tarih_istek", value: "Aranma zamanı seçin (mesai: {start}-{end})" },
   { key: "mesaj_ozel_tarih_onay", value: "Tercihiniz kaydedildi. {tarih} tarihinde sizi arayacağız." },
+  { key: "conversation_saklama_gunu", value: "30" },
 ];
 defaultSettings.forEach(({ key, value }) => {
   try {
@@ -117,6 +118,11 @@ function getLeads(limit = 200) {
     "SELECT * FROM leads ORDER BY created_at DESC LIMIT ?"
   );
   return stmt.all(limit).map(row => mapRowToLead(row));
+}
+
+function hasAnyLeadForChat(chatId) {
+  const row = db.prepare("SELECT 1 FROM leads WHERE chat_id = ? LIMIT 1").get(String(chatId));
+  return !!row;
 }
 
 function mapRowToLead(row) {
@@ -235,6 +241,37 @@ function addConversation(msg) {
   }
 }
 
+/** Telegram'da silinecek mesajların message_id'sini saklar. Veritabanı ve admin paneldeki konuşmalar silinmez. */
+db.exec(`
+  CREATE TABLE IF NOT EXISTS telegram_message_ids (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    timestamp INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_telegram_msg_ts ON telegram_message_ids(timestamp);
+`);
+
+function saveTelegramMessageId(chatId, messageId, timestamp) {
+  try {
+    db.prepare("INSERT INTO telegram_message_ids (chat_id, message_id, timestamp) VALUES (?, ?, ?)")
+      .run(String(chatId), messageId, timestamp || Date.now());
+  } catch (e) {
+    if (!String(e?.message || "").includes("UNIQUE")) console.warn("[telegram_msg] save:", e?.message);
+  }
+}
+
+function getOldTelegramMessageIds(days) {
+  if (!days || days <= 0) return [];
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  return db.prepare("SELECT id, chat_id, message_id FROM telegram_message_ids WHERE timestamp < ? ORDER BY timestamp ASC LIMIT 500")
+    .all(cutoff);
+}
+
+function deleteTelegramMessageIdRecord(id) {
+  db.prepare("DELETE FROM telegram_message_ids WHERE id = ?").run(id);
+}
+
 function getPackages() {
   const rows = db.prepare("SELECT * FROM packages ORDER BY sort_order ASC").all();
   return rows.map((row) => ({
@@ -297,6 +334,7 @@ module.exports = {
   db,
   getLeads,
   getLeadById,
+  hasAnyLeadForChat,
   insertLead,
   updateLead,
   getConversations,
@@ -307,4 +345,7 @@ module.exports = {
   getSetting,
   setSetting,
   getOrAssignVariant,
+  saveTelegramMessageId,
+  getOldTelegramMessageIds,
+  deleteTelegramMessageIdRecord,
 };
