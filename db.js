@@ -64,6 +64,15 @@ try { db.exec("ALTER TABLE leads ADD COLUMN model TEXT"); } catch (_) {}
 try { db.exec("ALTER TABLE leads ADD COLUMN km TEXT"); } catch (_) {}
 try { db.exec("ALTER TABLE leads ADD COLUMN ruhsat_seri_no TEXT"); } catch (_) {}
 try { db.exec("ALTER TABLE leads ADD COLUMN arama_tercihi TEXT"); } catch (_) {}
+try { db.exec("ALTER TABLE leads ADD COLUMN request_type TEXT DEFAULT 'teklif'"); } catch (_) {}
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS ab_variants (
+    chat_id TEXT PRIMARY KEY,
+    variant TEXT NOT NULL,
+    created_at INTEGER
+  )
+`);
 
 const defaultPackages = [
   { key: "pkg_eko", name: "Ekonomik", description: "Çarpışma, yangın, hırsızlık. Temel kapsam.", label: "Ekonomik kapsam", price: 0, discount_percent: 0, sort_order: 1 },
@@ -132,13 +141,14 @@ function mapRowToLead(row) {
     km: row.km ?? null,
     ruhsatSeriNo: row.ruhsat_seri_no ?? null,
     aramaTercihi: row.arama_tercihi ?? null,
+    requestType: row.request_type ?? "teklif",
   };
 }
 
 function insertLead(lead) {
   const stmt = db.prepare(`
-    INSERT INTO leads (chat_id, created_at, image_path, plate, plate_verified, tc, marka_km, package_choice, phone, status, offered_price, ruhsat_data, first_name, last_name, marka, model, km, ruhsat_seri_no)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO leads (chat_id, created_at, image_path, plate, plate_verified, tc, marka_km, package_choice, phone, status, offered_price, ruhsat_data, first_name, last_name, marka, model, km, ruhsat_seri_no, request_type)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const info = stmt.run(
     lead.chatId,
@@ -158,7 +168,8 @@ function insertLead(lead) {
     lead.marka ?? null,
     lead.model ?? null,
     lead.km ?? null,
-    lead.ruhsatSeriNo ?? null
+    lead.ruhsatSeriNo ?? null,
+    lead.requestType ?? "teklif"
   );
   return info.lastInsertRowid;
 }
@@ -255,6 +266,14 @@ function updatePackage(id, updates) {
   db.prepare(`UPDATE packages SET ${set.join(", ")} WHERE id = ?`).run(...values);
 }
 
+function getOrAssignVariant(chatId) {
+  const row = db.prepare("SELECT variant FROM ab_variants WHERE chat_id = ?").get(String(chatId));
+  if (row) return row.variant;
+  const v = Math.random() < 0.5 ? "A" : "B";
+  db.prepare("INSERT INTO ab_variants (chat_id, variant, created_at) VALUES (?, ?, ?)").run(String(chatId), v, Date.now());
+  return v;
+}
+
 function insertPackage(p) {
   const stmt = db.prepare(`
     INSERT INTO packages (key, name, description, label, price, discount_percent, sort_order)
@@ -287,4 +306,5 @@ module.exports = {
   insertPackage,
   getSetting,
   setSetting,
+  getOrAssignVariant,
 };
