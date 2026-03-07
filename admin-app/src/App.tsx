@@ -80,6 +80,7 @@ const STATUS_LABELS: Record<string, string> = {
   teklif_gonderildi: 'Teklif Gönderildi',
   arama_bekliyor: 'Aranma Bekleniyor',
   completed: 'Tamamlandı',
+  cancelled: 'İptal edildi',
 }
 
 function formatDate(ts: number) {
@@ -962,7 +963,7 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
                             <span className="lead-card-plaka">{plaka}</span>
                             <span className="lead-card-date" title={formatDate(row.createdAt)}>{formatRelativeTime(row.createdAt)}</span>
                           </div>
-                          <span className={`lead-card-status ${row.status === 'fiyat_bekleniyor' || row.status === 'arama_bekliyor' ? 'lead-card-status-warning' : ''}`}>
+                          <span className={`lead-card-status ${row.status === 'fiyat_bekleniyor' || row.status === 'arama_bekliyor' ? 'lead-card-status-warning' : row.status === 'cancelled' ? 'lead-card-status-cancelled' : ''}`}>
                             {statusLabel}
                           </span>
                         </div>
