@@ -4,6 +4,7 @@ const { OPENAI_API_KEY } = require("./config.js");
 
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 if (OPENAI_API_KEY) console.log("OPENAI_API_KEY: yüklendi (ruhsat AI aktif)");
+console.log("[Boot] index.js " + new Date().toISOString());
 
 const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
@@ -91,12 +92,20 @@ const STATUS_LABELS = {
   completed: "Tamamlandı",
 };
 
+const GUN_ADLARI = ["Pazar", "Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi"];
+
 function getMesaiSettings() {
   const start = getSetting("mesai_baslangic") || "09:00";
   const end = getSetting("mesai_bitis") || "18:00";
   const daysStr = getSetting("mesai_gunler") || "1,2,3,4,5";
   const days = daysStr.split(",").map((d) => parseInt(d.trim(), 10)).filter((n) => !isNaN(n) && n >= 0 && n <= 6);
   return { start, end, days: days.length ? days : [1, 2, 3, 4, 5] };
+}
+
+function getMesaiAraligi() {
+  const { start, end, days } = getMesaiSettings();
+  const gunStr = days.map((d) => GUN_ADLARI[d]).filter(Boolean).join("-") || "Pzt-Cum";
+  return `${start}-${end}, ${gunStr}`;
 }
 
 function parseTime(str) {
@@ -118,6 +127,48 @@ function isWithinMesai(now) {
   const endMins = parseTime(end);
   if (startMins == null || endMins == null) return true;
   return mins >= startMins && mins < endMins;
+}
+
+/** Mesai ayarlarından sonraki N mesai gününü döner. Özel tarih seçimi için. */
+function getOzelTarihGunler(now, limit = 5) {
+  const d = now instanceof Date ? now : new Date(now);
+  const { days } = getMesaiSettings();
+  const out = [];
+  for (let i = 0; i <= 14 && out.length < limit; i++) {
+    const x = new Date(d);
+    x.setDate(x.getDate() + i);
+    if (!days.includes(x.getDay())) continue;
+    const label = i === 0 ? "Bugün" : i === 1 ? "Yarın" : i === 2 ? "Öbür gün" : formatOzelTarihGun(x);
+    out.push({ offset: i, label, date: x });
+  }
+  return out;
+}
+
+function formatOzelTarihGun(d) {
+  const day = d.getDate();
+  const months = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık"];
+  return `${day} ${months[d.getMonth()]}`;
+}
+
+/** Belirtilen gün için mesai saat aralığındaki slotları döner (HHMM). Bugünse geçmiş saatler atlanır. */
+function getOzelTarihSaatler(dayOffset, now) {
+  const base = new Date(now);
+  base.setDate(base.getDate() + dayOffset);
+  base.setHours(0, 0, 0, 0);
+  const { start, end } = getMesaiSettings();
+  const startMins = parseTime(start) ?? 9 * 60;
+  const endMins = parseTime(end) ?? 18 * 60;
+  const slots = [];
+  const nowMins = (now.getHours() * 60 + now.getMinutes());
+  for (let m = startMins; m < endMins; m += 60) {
+    if (dayOffset === 0 && m <= nowMins) continue;
+    const h = Math.floor(m / 60);
+    const min = m % 60;
+    const hhmm = String(h).padStart(2, "0") + String(min).padStart(2, "0");
+    const label = `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+    slots.push({ hhmm, label });
+  }
+  return slots;
 }
 
 function getTahminiAramaSuresi(now) {
@@ -223,18 +274,30 @@ app.get("/api/settings", apiAuth, (req, res) => {
     mesai_baslangic: getSetting("mesai_baslangic") || "09:00",
     mesai_bitis: getSetting("mesai_bitis") || "18:00",
     mesai_gunler: getSetting("mesai_gunler") || "1,2,3,4,5",
+    mesaj_hemen_mesai_ici: getSetting("mesaj_hemen_mesai_ici") || "Müşteri temsilcilerimiz en kısa sürede sizi arayacak.",
+    mesaj_hemen_mesai_dis: getSetting("mesaj_hemen_mesai_dis") || "Üzgünüz, şu anda mesai saatleri içinde değiliz. {mesaiAraligi} aralığında Özel tarih seçerek aranma zamanı oluşturabilirsiniz.",
+    mesaj_ozel_tarih_istek: getSetting("mesaj_ozel_tarih_istek") || "Aranma zamanı seçin (mesai: {start}-{end})",
+    mesaj_ozel_tarih_onay: getSetting("mesaj_ozel_tarih_onay") || "Tercihiniz kaydedildi. {tarih} tarihinde sizi arayacağız.",
   });
 });
 
 app.put("/api/settings", apiAuth, (req, res) => {
-  const { mesai_baslangic, mesai_bitis, mesai_gunler } = req.body || {};
+  const { mesai_baslangic, mesai_bitis, mesai_gunler, mesaj_hemen_mesai_ici, mesaj_hemen_mesai_dis, mesaj_ozel_tarih_istek, mesaj_ozel_tarih_onay } = req.body || {};
   if (mesai_baslangic !== undefined) setSetting("mesai_baslangic", mesai_baslangic);
   if (mesai_bitis !== undefined) setSetting("mesai_bitis", mesai_bitis);
   if (mesai_gunler !== undefined) setSetting("mesai_gunler", mesai_gunler);
+  if (mesaj_hemen_mesai_ici !== undefined) setSetting("mesaj_hemen_mesai_ici", mesaj_hemen_mesai_ici);
+  if (mesaj_hemen_mesai_dis !== undefined) setSetting("mesaj_hemen_mesai_dis", mesaj_hemen_mesai_dis);
+  if (mesaj_ozel_tarih_istek !== undefined) setSetting("mesaj_ozel_tarih_istek", mesaj_ozel_tarih_istek);
+  if (mesaj_ozel_tarih_onay !== undefined) setSetting("mesaj_ozel_tarih_onay", mesaj_ozel_tarih_onay);
   res.json({
     mesai_baslangic: getSetting("mesai_baslangic") || "09:00",
     mesai_bitis: getSetting("mesai_bitis") || "18:00",
     mesai_gunler: getSetting("mesai_gunler") || "1,2,3,4,5",
+    mesaj_hemen_mesai_ici: getSetting("mesaj_hemen_mesai_ici") || "Müşteri temsilcilerimiz en kısa sürede sizi arayacak.",
+    mesaj_hemen_mesai_dis: getSetting("mesaj_hemen_mesai_dis") || "Üzgünüz, şu anda mesai saatleri içinde değiliz. {mesaiAraligi} aralığında Özel tarih seçerek aranma zamanı oluşturabilirsiniz.",
+    mesaj_ozel_tarih_istek: getSetting("mesaj_ozel_tarih_istek") || "Aranma zamanı seçin (mesai: {start}-{end})",
+    mesaj_ozel_tarih_onay: getSetting("mesaj_ozel_tarih_onay") || "Tercihiniz kaydedildi. {tarih} tarihinde sizi arayacağız.",
   });
 });
 
@@ -468,21 +531,27 @@ const MENU_TEXT =
  bot.on("callback_query", async (ctx) => {
    const data = ctx.callbackQuery?.data;
    const chatId = ctx.callbackQuery?.message?.chat?.id;
+   if (data?.startsWith("arama_")) console.log("[callback] arama:", data, "chatId:", chatId);
    if (!data || !chatId) return ctx.answerCbQuery();
 
-   await ctx.answerCbQuery();
+   try {
+   try { await ctx.answerCbQuery(); } catch (e) { if (!String(e?.message || "").includes("too old")) console.warn("answerCbQuery:", e?.message); }
 
-   if (data.startsWith("arama_evet_")) {
-     const leadId = parseInt(data.replace("arama_evet_", ""), 10);
-     const lead = leadId ? getLeadById(leadId) : null;
-     if (lead && lead.chatId === chatId) {
-       const zamanKeyboard = Markup.inlineKeyboard([
+  if (data.startsWith("arama_evet_")) {
+    const leadId = parseInt(data.replace("arama_evet_", ""), 10);
+    const lead = leadId ? getLeadById(leadId) : null;
+    const chatMatch = lead && (String(lead.chatId) === String(chatId) || lead.chatId == chatId);
+    if (!lead) console.warn("[arama_evet] Lead bulunamadi:", leadId);
+    else if (!chatMatch) console.warn("[arama_evet] chatId eslesmedi:", { leadChatId: lead.chatId, ctxChatId: chatId, types: [typeof lead.chatId, typeof chatId] });
+    if (lead && chatMatch) {
+       const now = new Date();
+       const mesaiIci = isWithinMesai(now);
+       const rows = [
          [Markup.button.callback("Hemen", "arama_zaman_hemen_" + leadId)],
-         [Markup.button.callback("Bugün mesai içinde", "arama_zaman_bugun_" + leadId)],
-         [Markup.button.callback("Yarın", "arama_zaman_yarin_" + leadId)],
-         [Markup.button.callback("İleride belirteceğim", "arama_zaman_ileride_" + leadId)],
-       ]);
-       await ctx.telegram.sendMessage(chatId, "Sizi ne zaman aramamızı istersiniz?", zamanKeyboard);
+         [Markup.button.callback("Özel tarih", "arama_zaman_ozel_tarih_" + leadId)],
+       ];
+       const mesaj = mesaiIci ? "Temsilcimiz sizi ne zaman arasın?" : "Üzgünüz, şu anda mesai saatleri dışındayız. Temsilcimiz sizi ne zaman arasın?";
+       await ctx.telegram.sendMessage(chatId, mesaj, Markup.inlineKeyboard(rows));
      }
      return;
    }
@@ -492,21 +561,89 @@ const MENU_TEXT =
      const choice = lastUnderscore >= 0 ? rest.slice(0, lastUnderscore) : rest;
      const leadId = parseInt(lastUnderscore >= 0 ? rest.slice(lastUnderscore + 1) : "", 10);
      const lead = leadId ? getLeadById(leadId) : null;
-     if (lead && lead.chatId === chatId) {
-       const choiceLabels = { hemen: "Hemen", bugun: "Bugün mesai içinde", yarin: "Yarın", ileride: "İleride belirteceğim" };
-       const label = choiceLabels[choice] || choice;
+     const chatMatch = lead && (String(lead.chatId) === String(chatId) || lead.chatId == chatId);
+     if (!lead) console.warn("[arama_zaman] Lead bulunamadi:", leadId, "data:", data);
+     else if (!chatMatch) console.warn("[arama_zaman] chatId eslesmedi:", { leadChatId: lead.chatId, ctxChatId: chatId });
+     if (lead && chatMatch && choice === "ozel_tarih") {
        const now = new Date();
-       let confirmMsg = `Tercihiniz (${label}) kaydedildi. `;
-       if (choice === "hemen" && isWithinMesai(now)) {
-         confirmMsg += "Müşteri temsilcimiz kısa süre içinde sizi arayacak.";
-       } else if (choice === "hemen" || choice === "bugun") {
-         const tahmini = getTahminiAramaSuresi(now);
-         confirmMsg += "Müşteri temsilcimiz mesai saatleri içinde sizi arayacak. Tahmini süre: " + tahmini;
-       } else {
-         confirmMsg += "Müşteri temsilcimiz belirttiğiniz zaman diliminde sizi arayacak.";
+       const gunler = getOzelTarihGunler(now);
+       if (gunler.length === 0) {
+         await ctx.telegram.sendMessage(chatId, "Şu an için uygun mesai günü bulunamadı. Lütfen daha sonra tekrar deneyin.");
+         return;
        }
-       await ctx.telegram.sendMessage(chatId, confirmMsg);
-       updateLead(lead.id, { status: "arama_bekliyor", aramaTercihi: label });
+       const rows = gunler.map((g) => [Markup.button.callback(g.label, "arama_ozel_gun_" + g.offset + "_" + lead.id)]);
+       const { start, end } = getMesaiSettings();
+       const istekTpl = getSetting("mesaj_ozel_tarih_istek") || "Aranma zamanı seçin (mesai: {start}-{end})";
+       const istekMsg = istekTpl.replace(/\{start\}/g, start).replace(/\{end\}/g, end);
+       await ctx.telegram.sendMessage(chatId, istekMsg, Markup.inlineKeyboard(rows));
+       return;
+     }
+     if (lead && chatMatch && choice === "hemen") {
+       const now = new Date();
+       const mesaiIci = isWithinMesai(now);
+       if (mesaiIci) {
+         const msg = getSetting("mesaj_hemen_mesai_ici") || "Müşteri temsilcilerimiz en kısa sürede sizi arayacak.";
+         await ctx.telegram.sendMessage(chatId, msg);
+         updateLead(lead.id, { status: "arama_bekliyor", aramaTercihi: "Hemen" });
+         console.log("[arama_zaman] OK - lead", lead.id, "status=arama_bekliyor", "tercih=Hemen");
+       } else {
+         const template = getSetting("mesaj_hemen_mesai_dis") || "Üzgünüz, şu anda mesai saatleri içinde değiliz. {mesaiAraligi} aralığında Özel tarih seçerek aranma zamanı oluşturabilirsiniz.";
+         const msg = template.replace(/\{mesaiAraligi\}/g, getMesaiAraligi());
+         const rows = [[Markup.button.callback("Özel tarih", "arama_zaman_ozel_tarih_" + lead.id)]];
+         await ctx.telegram.sendMessage(chatId, msg, Markup.inlineKeyboard(rows));
+       }
+     }
+     return;
+   }
+   if (data.startsWith("arama_ozel_gun_")) {
+     const parts = data.replace("arama_ozel_gun_", "").split("_");
+     const dayOffset = parseInt(parts[0], 10);
+     const leadId = parseInt(parts[1], 10);
+     const lead = leadId ? getLeadById(leadId) : null;
+     const chatMatch = lead && (String(lead.chatId) === String(chatId) || lead.chatId == chatId);
+     if (lead && chatMatch) {
+       const now = new Date();
+       const saatler = getOzelTarihSaatler(dayOffset, now);
+       if (saatler.length === 0) {
+         await ctx.telegram.sendMessage(chatId, "Bu gün için uygun saat kalmadı. Lütfen başka bir gün seçin.");
+         return;
+       }
+       const perRow = 4;
+       const rows = [];
+       for (let i = 0; i < saatler.length; i += perRow) {
+         const chunk = saatler.slice(i, i + perRow);
+         rows.push(chunk.map((s) => Markup.button.callback(s.label, "arama_ozel_saat_" + dayOffset + "_" + s.hhmm + "_" + lead.id)));
+       }
+       const gunler = getOzelTarihGunler(now);
+       const gunLabel = gunler.find((g) => g.offset === dayOffset)?.label || `${dayOffset} gün sonra`;
+       await ctx.telegram.sendMessage(chatId, `${gunLabel} için saat seçin:`, Markup.inlineKeyboard(rows));
+     }
+     return;
+   }
+   if (data.startsWith("arama_ozel_saat_")) {
+     const rest = data.replace("arama_ozel_saat_", "");
+     const match = rest.match(/^(\d+)_(\d{4})_(\d+)$/);
+     if (!match) return;
+     const dayOffset = parseInt(match[1], 10);
+     const hhmm = match[2];
+     const leadId = parseInt(match[3], 10);
+     const lead = leadId ? getLeadById(leadId) : null;
+     const chatMatch = lead && (String(lead.chatId) === String(chatId) || lead.chatId == chatId);
+     if (lead && chatMatch) {
+       const now = new Date();
+       const d = new Date(now);
+       d.setDate(d.getDate() + dayOffset);
+       const h = parseInt(hhmm.slice(0, 2), 10);
+       const m = parseInt(hhmm.slice(2, 4), 10);
+       d.setHours(h, m, 0, 0);
+       const gunler = getOzelTarihGunler(new Date(), 1);
+       const gunLabel = dayOffset === 0 ? "Bugün" : dayOffset === 1 ? "Yarın" : formatOzelTarihGun(d);
+       const saatLabel = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+       const aramaTercihi = `${gunLabel} ${saatLabel}`;
+       updateLead(lead.id, { status: "arama_bekliyor", aramaTercihi });
+       const onayTpl = getSetting("mesaj_ozel_tarih_onay") || "Tercihiniz kaydedildi. {tarih} tarihinde sizi arayacağız.";
+       await ctx.telegram.sendMessage(chatId, onayTpl.replace(/\{tarih\}/g, aramaTercihi));
+       console.log("[arama_ozel_saat] OK - lead", lead.id, "aramaTercihi=", aramaTercihi);
      }
      return;
    }
@@ -602,6 +739,9 @@ const MENU_TEXT =
        addMessage(chatId, "bot", reply);
        await ctx.telegram.sendMessage(chatId, reply);
      }
+   }
+   } catch (err) {
+     console.error("callback_query error:", err.message || err);
    }
  });
 

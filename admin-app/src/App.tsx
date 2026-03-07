@@ -225,7 +225,7 @@ function useApi(token: string | null) {
     return res.json()
   }, [token])
 
-  type Settings = { mesai_baslangic: string; mesai_bitis: string; mesai_gunler: string }
+  type Settings = { mesai_baslangic: string; mesai_bitis: string; mesai_gunler: string; mesaj_hemen_mesai_ici?: string; mesaj_hemen_mesai_dis?: string; mesaj_ozel_tarih_istek?: string; mesaj_ozel_tarih_onay?: string }
   const fetchSettings = useCallback(async (): Promise<Settings> => {
     if (!token) throw new Error('Unauthorized')
     const res = await fetch(`${API_BASE}/api/settings`, { headers: headers() })
@@ -681,6 +681,10 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
   const [settingsLoading, setSettingsLoading] = useState(false)
   const [settingsSaveError, setSettingsSaveError] = useState('')
   const [settingsSaveSuccess, setSettingsSaveSuccess] = useState(false)
+  const [mesajHemenMesaiIci, setMesajHemenMesaiIci] = useState('')
+  const [mesajHemenMesaiDis, setMesajHemenMesaiDis] = useState('')
+  const [mesajOzelTarihIstek, setMesajOzelTarihIstek] = useState('')
+  const [mesajOzelTarihOnay, setMesajOzelTarihOnay] = useState('')
 
   const filteredLeads = useMemo(() => {
     let list = leads
@@ -723,8 +727,8 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
     setLeadDateTo(to)
   }, [])
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  const load = useCallback(async (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setLoading(true)
     setErr('')
     try {
       const [l, c] = await Promise.all([fetchLeads(), fetchConversations()])
@@ -735,7 +739,7 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
       setErr(msg === 'SESSION_EXPIRED' ? 'Oturum süresi doldu. Tekrar giriş yapın.' : msg)
       if (msg === 'SESSION_EXPIRED') onLogout()
     } finally {
-      setLoading(false)
+      if (!opts?.silent) setLoading(false)
     }
   }, [fetchLeads, fetchConversations, onLogout])
 
@@ -840,6 +844,12 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
   }, [load])
 
   useEffect(() => {
+    if (tab !== 'leads') return
+    const interval = setInterval(() => load({ silent: true }), 10000)
+    return () => clearInterval(interval)
+  }, [tab, load])
+
+  useEffect(() => {
     if (tab !== 'settings') return
     setSettingsLoading(true)
     setSettingsSaveError('')
@@ -849,6 +859,10 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
         setMesaiBitis(s.mesai_bitis || '18:00')
         const days = (s.mesai_gunler || '1,2,3,4,5').split(',').map((d) => parseInt(d.trim(), 10)).filter((n) => !isNaN(n) && n >= 0 && n <= 6)
         setMesaiGunler(days.length ? days : [1, 2, 3, 4, 5])
+        setMesajHemenMesaiIci(s.mesaj_hemen_mesai_ici ?? '')
+        setMesajHemenMesaiDis(s.mesaj_hemen_mesai_dis ?? '')
+        setMesajOzelTarihIstek(s.mesaj_ozel_tarih_istek ?? '')
+        setMesajOzelTarihOnay(s.mesaj_ozel_tarih_onay ?? '')
       })
       .catch(() => setSettingsSaveError('Ayarlar yüklenemedi'))
       .finally(() => setSettingsLoading(false))
@@ -860,7 +874,7 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
         <h1>Sigorta Admin</h1>
         <div className="header-actions">
           <ThemeToggle theme={theme} setTheme={setTheme} />
-          <button type="button" onClick={load} disabled={loading}>Yenile</button>
+          <button type="button" onClick={() => load()} disabled={loading}>Yenile</button>
           <button type="button" onClick={() => onLogout()} className="outline">Çıkış</button>
         </div>
       </header>
@@ -986,9 +1000,7 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
           {settingsLoading ? (
             <p>Yükleniyor…</p>
           ) : (
-            <form
-              className="settings-form"
-              onSubmit={async (e) => {
+            <form className="settings-form" onSubmit={async (e) => {
                 e.preventDefault()
                 setSettingsSaveError('')
                 setSettingsSaveSuccess(false)
@@ -997,6 +1009,10 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
                     mesai_baslangic: mesaiBaslangic,
                     mesai_bitis: mesaiBitis,
                     mesai_gunler: mesaiGunler.sort((a, b) => a - b).join(','),
+                    mesaj_hemen_mesai_ici: mesajHemenMesaiIci,
+                    mesaj_hemen_mesai_dis: mesajHemenMesaiDis,
+                    mesaj_ozel_tarih_istek: mesajOzelTarihIstek,
+                    mesaj_ozel_tarih_onay: mesajOzelTarihOnay,
                   })
                   setSettingsSaveSuccess(true)
                   setTimeout(() => setSettingsSaveSuccess(false), 3000)
@@ -1005,6 +1021,9 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
                 }
               }}
             >
+              <section className="settings-section">
+                <h2>Mesai saatleri</h2>
+                <p className="settings-desc">Müşteri “Evet, arasın” dediğinde mesai dışındaysa Özel tarih seçenekleri bu saatlere göre hesaplanır.</p>
               <div className="settings-row">
                 <label>
                   <span>Başlangıç</span>
@@ -1041,6 +1060,37 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
                   ))}
                 </div>
               </div>
+              </section>
+              <section className="settings-section">
+                <h2>Hemen mesajları</h2>
+              <p className="settings-desc">Müşteri “Hemen” seçeneğine bastığında göreceği mesajlar. Mesai dışı mesajda {`{mesaiAraligi}`} otomatik doldurulur.</p>
+              <div className="settings-row settings-messages-row">
+                <label>
+                  <span>Mesai içindeyken</span>
+                  <textarea value={mesajHemenMesaiIci} onChange={(e) => setMesajHemenMesaiIci(e.target.value)} rows={3} placeholder="Müşteri temsilcilerimiz en kısa sürede sizi arayacak." />
+                </label>
+                <label>
+                  <span>Mesai dışındayken</span>
+                  <textarea value={mesajHemenMesaiDis} onChange={(e) => setMesajHemenMesaiDis(e.target.value)} rows={3} placeholder="Üzgünüz, şu anda mesai saatleri içinde değiliz. {mesaiAraligi} aralığında Özel tarih seçerek aranma zamanı oluşturabilirsiniz." />
+                </label>
+              </div>
+              </section>
+
+              <section className="settings-section">
+                <h2>Özel tarih mesajları</h2>
+                <p className="settings-desc">Müşteri “Özel tarih” butonuna bastığında göreceği mesajlar. {`{start}`}, {`{end}`} = mesai saatleri, {`{tarih}`} = seçilen gün/saat.</p>
+                <div className="settings-row settings-messages-row">
+                  <label>
+                    <span>Gün/saat seçim istemi</span>
+                    <textarea value={mesajOzelTarihIstek} onChange={(e) => setMesajOzelTarihIstek(e.target.value)} rows={2} placeholder="Aranma zamanı seçin (mesai: {start}-{end})" />
+                  </label>
+                  <label>
+                    <span>Onay mesajı</span>
+                    <textarea value={mesajOzelTarihOnay} onChange={(e) => setMesajOzelTarihOnay(e.target.value)} rows={2} placeholder="Tercihiniz kaydedildi. {tarih} tarihinde sizi arayacağız." />
+                  </label>
+                </div>
+              </section>
+
               {settingsSaveError && <p className="error">{settingsSaveError}</p>}
               {settingsSaveSuccess && <p className="success">Ayarlar kaydedildi.</p>}
               <button type="submit" className="lead-btn lead-btn-primary">Kaydet</button>

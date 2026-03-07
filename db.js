@@ -83,6 +83,10 @@ const defaultSettings = [
   { key: "mesai_baslangic", value: "09:00" },
   { key: "mesai_bitis", value: "18:00" },
   { key: "mesai_gunler", value: "1,2,3,4,5" },
+  { key: "mesaj_hemen_mesai_ici", value: "Müşteri temsilcilerimiz en kısa sürede sizi arayacak." },
+  { key: "mesaj_hemen_mesai_dis", value: "Üzgünüz, şu anda mesai saatleri içinde değiliz. {mesaiAraligi} aralığında Özel tarih seçerek aranma zamanı oluşturabilirsiniz." },
+  { key: "mesaj_ozel_tarih_istek", value: "Aranma zamanı seçin (mesai: {start}-{end})" },
+  { key: "mesaj_ozel_tarih_onay", value: "Tercihiniz kaydedildi. {tarih} tarihinde sizi arayacağız." },
 ];
 defaultSettings.forEach(({ key, value }) => {
   try {
