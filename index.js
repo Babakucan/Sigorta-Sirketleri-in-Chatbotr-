@@ -156,7 +156,7 @@ function getOzelTarihGunler(now, limit = 5) {
     const x = new Date(d);
     x.setDate(x.getDate() + i);
     if (!days.includes(x.getDay())) continue;
-    const label = i === 0 ? "Bugün" : i === 1 ? "Yarın" : i === 2 ? "Öbür gün" : formatOzelTarihGun(x);
+    const label = i === 0 ? "Bugün" : i === 1 ? "Yarın" : formatOzelTarihGun(x);
     out.push({ offset: i, label, date: x });
   }
   return out;
