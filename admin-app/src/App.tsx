@@ -452,7 +452,19 @@ function Login({ onLogin }: { onLogin: (token: string) => void }) {
   )
 }
 
-function ConversationsView({ conversations, formatDate, initialChatId }: { conversations: Conversation[]; formatDate: (ts: number) => string; initialChatId?: string | null }) {
+function ConversationsView({ conversations, formatDate, initialChatId, leads = [] }: { conversations: Conversation[]; formatDate: (ts: number) => string; initialChatId?: string | null; leads?: Lead[] }) {
+  const chatIdToName = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const l of leads) {
+      const chatId = String(l.chatId)
+      const sahibi = (l.ruhsatData?.sahibiAdiSoyadi ?? '').trim().split(/\s+/)
+      const ad = (l.firstName ?? sahibi[0] ?? '').trim()
+      const soyad = (l.lastName ?? sahibi.slice(1).join(' ') ?? '').trim()
+      const full = [ad, soyad].filter(Boolean).join(' ')
+      if (full) map.set(chatId, full)
+    }
+    return map
+  }, [leads])
   const { byChat, chatIds } = useMemo(() => {
     const map = new Map<string, Conversation[]>()
     for (const m of conversations) {
@@ -490,6 +502,7 @@ function ConversationsView({ conversations, formatDate, initialChatId }: { conve
               const msgs = byChat.get(cid)!
               const last = msgs.reduce((a, m) => (m.timestamp > a ? m.timestamp : a), 0)
               const preview = msgs.filter((m) => m.text)[msgs.length - 1]?.text?.slice(0, 30) || '—'
+              const displayName = chatIdToName.get(cid) ?? `ID: ${cid}`
               return (
                 <li key={cid}>
                   <button
@@ -497,7 +510,7 @@ function ConversationsView({ conversations, formatDate, initialChatId }: { conve
                     className={activeChat === cid ? 'active' : ''}
                     onClick={() => setSelectedChat(cid)}
                   >
-                    <span className="chat-id">ID: {cid}</span>
+                    <span className="chat-id">{displayName}</span>
                     <span className="preview">{preview}{preview.length >= 30 ? '…' : ''}</span>
                     <span className="time">{formatDate(last)}</span>
                   </button>
@@ -511,7 +524,7 @@ function ConversationsView({ conversations, formatDate, initialChatId }: { conve
         {activeChat ? (
           <>
             <div className="thread-header">
-              <strong>Konuşma — {activeChat}</strong>
+              <strong>Konuşma — {chatIdToName.get(activeChat) ?? activeChat}</strong>
             </div>
             <div className="thread-messages">
               {messages.map((m, i) => (
@@ -860,13 +873,40 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
         const days = (s.mesai_gunler || '1,2,3,4,5').split(',').map((d) => parseInt(d.trim(), 10)).filter((n) => !isNaN(n) && n >= 0 && n <= 6)
         setMesaiGunler(days.length ? days : [1, 2, 3, 4, 5])
         setMesajHemenMesaiIci(s.mesaj_hemen_mesai_ici ?? '')
-        setMesajHemenMesaiDis(s.mesaj_hemen_mesai_dis ?? '')
-        setMesajOzelTarihIstek(s.mesaj_ozel_tarih_istek ?? '')
+        let hemenDis = s.mesaj_hemen_mesai_dis ?? ''
+        let ozelIstek = s.mesaj_ozel_tarih_istek ?? ''
+        // Yanlışlıkla "Özel tarih" alanına kaydedilmiş "Mesai dışındayken" metnini Hemen kartına geri al
+        if (ozelIstek && ozelIstek.includes('mesai saatleri içinde değiliz')) {
+          hemenDis = ozelIstek
+          ozelIstek = 'Aranma zamanı seçin (mesai: {start}-{end})'
+        }
+        setMesajHemenMesaiDis(hemenDis)
+        setMesajOzelTarihIstek(ozelIstek)
         setMesajOzelTarihOnay(s.mesaj_ozel_tarih_onay ?? '')
       })
       .catch(() => setSettingsSaveError('Ayarlar yüklenemedi'))
       .finally(() => setSettingsLoading(false))
   }, [tab, fetchSettings])
+
+  const handleSaveSettings = async () => {
+    setSettingsSaveError('')
+    setSettingsSaveSuccess(false)
+    try {
+      await saveSettings({
+        mesai_baslangic: mesaiBaslangic,
+        mesai_bitis: mesaiBitis,
+        mesai_gunler: mesaiGunler.sort((a, b) => a - b).join(','),
+        mesaj_hemen_mesai_ici: mesajHemenMesaiIci,
+        mesaj_hemen_mesai_dis: mesajHemenMesaiDis,
+        mesaj_ozel_tarih_istek: mesajOzelTarihIstek,
+        mesaj_ozel_tarih_onay: mesajOzelTarihOnay,
+      })
+      setSettingsSaveSuccess(true)
+      setTimeout(() => setSettingsSaveSuccess(false), 3000)
+    } catch (err) {
+      setSettingsSaveError(err instanceof Error ? err.message : 'Kaydedilemedi')
+    }
+  }
 
   return (
     <div className="dashboard">
@@ -992,108 +1032,98 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
           )}
         </div>
       ) : tab === 'conversations' ? (
-        <ConversationsView conversations={conversations} formatDate={formatDate} initialChatId={conversationChatId} />
+        <ConversationsView conversations={conversations} formatDate={formatDate} initialChatId={conversationChatId} leads={leads} />
       ) : tab === 'settings' ? (
         <div className="settings-view">
-          <h2>Mesai saatleri</h2>
-          <p className="settings-desc">Müşteri “Evet, arasın” dediğinde mesai dışındaysa tahmini arama süresi bu saatlere göre hesaplanır.</p>
           {settingsLoading ? (
-            <p>Yükleniyor…</p>
+            <p className="settings-loading">Yükleniyor…</p>
           ) : (
-            <form className="settings-form" onSubmit={async (e) => {
-                e.preventDefault()
-                setSettingsSaveError('')
-                setSettingsSaveSuccess(false)
-                try {
-                  await saveSettings({
-                    mesai_baslangic: mesaiBaslangic,
-                    mesai_bitis: mesaiBitis,
-                    mesai_gunler: mesaiGunler.sort((a, b) => a - b).join(','),
-                    mesaj_hemen_mesai_ici: mesajHemenMesaiIci,
-                    mesaj_hemen_mesai_dis: mesajHemenMesaiDis,
-                    mesaj_ozel_tarih_istek: mesajOzelTarihIstek,
-                    mesaj_ozel_tarih_onay: mesajOzelTarihOnay,
-                  })
-                  setSettingsSaveSuccess(true)
-                  setTimeout(() => setSettingsSaveSuccess(false), 3000)
-                } catch (err) {
-                  setSettingsSaveError(err instanceof Error ? err.message : 'Kaydedilemedi')
-                }
-              }}
-            >
-              <section className="settings-section">
-                <h2>Mesai saatleri</h2>
-                <p className="settings-desc">Müşteri “Evet, arasın” dediğinde mesai dışındaysa Özel tarih seçenekleri bu saatlere göre hesaplanır.</p>
-              <div className="settings-row">
-                <label>
-                  <span>Başlangıç</span>
-                  <input type="time" value={mesaiBaslangic} onChange={(e) => setMesaiBaslangic(e.target.value)} />
-                </label>
-                <label>
-                  <span>Bitiş</span>
-                  <input type="time" value={mesaiBitis} onChange={(e) => setMesaiBitis(e.target.value)} />
-                </label>
+            <form className="settings-form" onSubmit={(e) => { e.preventDefault(); handleSaveSettings(); }}>
+              <div className="settings-grid">
+                <article className="settings-card">
+                  <header className="settings-card-header">
+                    <h2>Hemen mesajları</h2>
+                    <p className="settings-card-desc">Müşteri "Hemen" seçeneğine bastığında göreceği mesajlar. Mesai dışı mesajda <code>{'{mesaiAraligi}'}</code> otomatik doldurulur.</p>
+                  </header>
+                  <div className="settings-card-body">
+                    <div className="settings-field">
+                      <label className="settings-field-label">Mesai içindeyken</label>
+                      <textarea className="settings-textarea" value={mesajHemenMesaiIci} onChange={(e) => setMesajHemenMesaiIci(e.target.value)} rows={4} placeholder="Müşteri temsilcilerimiz en kısa sürede sizi arayacak." />
+                    </div>
+                    <div className="settings-field">
+                      <label className="settings-field-label">Mesai dışındayken</label>
+                      <textarea className="settings-textarea" value={mesajHemenMesaiDis} onChange={(e) => setMesajHemenMesaiDis(e.target.value)} rows={4} placeholder="Üzgünüz, şu anda mesai saatleri içinde değiliz. {mesaiAraligi} aralığında Özel tarih seçerek aranma zamanı oluşturabilirsiniz." />
+                    </div>
+                    <button type="button" className="lead-btn lead-btn-primary settings-card-save" onClick={handleSaveSettings}>Kaydet</button>
+                  </div>
+                </article>
+                <article className="settings-card">
+                  <header className="settings-card-header">
+                    <h2>Özel tarih mesajları</h2>
+                    <p className="settings-card-desc">Müşteri "Özel tarih" butonuna bastığında göreceği mesajlar. <code>{'{start}'}</code>, <code>{'{end}'}</code> = mesai saatleri, <code>{'{tarih}'}</code> = seçilen gün/saat.</p>
+                  </header>
+                  <div className="settings-card-body">
+                    <div className="settings-field">
+                      <label className="settings-field-label">Gün/saat seçim istemi</label>
+                      <textarea className="settings-textarea settings-textarea-lg" value={mesajOzelTarihIstek} onChange={(e) => setMesajOzelTarihIstek(e.target.value)} rows={5} placeholder={'Aranma zamanı seçin (mesai: {start}-{end})'} />
+                    </div>
+                    <div className="settings-field">
+                      <label className="settings-field-label">Onay mesajı</label>
+                      <textarea className="settings-textarea" value={mesajOzelTarihOnay} onChange={(e) => setMesajOzelTarihOnay(e.target.value)} rows={3} placeholder={'Tercihiniz kaydedildi. {tarih} tarihinde sizi arayacağız.'} />
+                    </div>
+                    <button type="button" className="lead-btn lead-btn-primary settings-card-save" onClick={handleSaveSettings}>Kaydet</button>
+                  </div>
+                </article>
               </div>
-              <div className="settings-row">
-                <span className="settings-label">Mesai günleri</span>
-                <div className="settings-days">
-                  {[
-                    { v: 0, label: 'Paz' },
-                    { v: 1, label: 'Pzt' },
-                    { v: 2, label: 'Sal' },
-                    { v: 3, label: 'Çar' },
-                    { v: 4, label: 'Per' },
-                    { v: 5, label: 'Cum' },
-                    { v: 6, label: 'Cmt' },
-                  ].map(({ v, label }) => (
-                    <label key={v} className="settings-day">
-                      <input
-                        type="checkbox"
-                        checked={mesaiGunler.includes(v)}
-                        onChange={(e) => {
-                          if (e.target.checked) setMesaiGunler((prev) => [...prev, v].sort((a, b) => a - b))
-                          else setMesaiGunler((prev) => prev.filter((d) => d !== v))
-                        }}
-                      />
-                      <span>{label}</span>
-                    </label>
-                  ))}
+              <article className="settings-card settings-card-mesai">
+                <header className="settings-card-header">
+                  <h2>Mesai saatleri</h2>
+                  <p className="settings-card-desc">Müşteri "Evet, arasın" dediğinde mesai dışındaysa Özel tarih seçenekleri bu saatlere göre hesaplanır.</p>
+                </header>
+                <div className="settings-card-body settings-mesai-body">
+                  <div className="settings-mesai-time">
+                    <div className="settings-field-inline">
+                      <label className="settings-field-label">Başlangıç</label>
+                      <input type="time" value={mesaiBaslangic} onChange={(e) => setMesaiBaslangic(e.target.value)} className="settings-time-input" />
+                    </div>
+                    <span className="settings-mesai-sep">–</span>
+                    <div className="settings-field-inline">
+                      <label className="settings-field-label">Bitiş</label>
+                      <input type="time" value={mesaiBitis} onChange={(e) => setMesaiBitis(e.target.value)} className="settings-time-input" />
+                    </div>
+                  </div>
+                  <div className="settings-field">
+                    <span className="settings-field-label">Mesai günleri</span>
+                    <div className="settings-days">
+                      {[
+                        { v: 0, label: 'Paz' },
+                        { v: 1, label: 'Pzt' },
+                        { v: 2, label: 'Sal' },
+                        { v: 3, label: 'Çar' },
+                        { v: 4, label: 'Per' },
+                        { v: 5, label: 'Cum' },
+                        { v: 6, label: 'Cmt' },
+                      ].map(({ v, label }) => (
+                        <label key={v} className="settings-day">
+                          <input
+                            type="checkbox"
+                            checked={mesaiGunler.includes(v)}
+                            onChange={(e) => {
+                              if (e.target.checked) setMesaiGunler((prev) => [...prev, v].sort((a, b) => a - b))
+                              else setMesaiGunler((prev) => prev.filter((d) => d !== v))
+                            }}
+                          />
+                          <span>{label}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  <button type="button" className="lead-btn lead-btn-primary settings-card-save" onClick={handleSaveSettings}>Kaydet</button>
                 </div>
-              </div>
-              </section>
-              <section className="settings-section">
-                <h2>Hemen mesajları</h2>
-              <p className="settings-desc">Müşteri “Hemen” seçeneğine bastığında göreceği mesajlar. Mesai dışı mesajda {`{mesaiAraligi}`} otomatik doldurulur.</p>
-              <div className="settings-row settings-messages-row">
-                <label>
-                  <span>Mesai içindeyken</span>
-                  <textarea value={mesajHemenMesaiIci} onChange={(e) => setMesajHemenMesaiIci(e.target.value)} rows={3} placeholder="Müşteri temsilcilerimiz en kısa sürede sizi arayacak." />
-                </label>
-                <label>
-                  <span>Mesai dışındayken</span>
-                  <textarea value={mesajHemenMesaiDis} onChange={(e) => setMesajHemenMesaiDis(e.target.value)} rows={3} placeholder="Üzgünüz, şu anda mesai saatleri içinde değiliz. {mesaiAraligi} aralığında Özel tarih seçerek aranma zamanı oluşturabilirsiniz." />
-                </label>
-              </div>
-              </section>
+              </article>
 
-              <section className="settings-section">
-                <h2>Özel tarih mesajları</h2>
-                <p className="settings-desc">Müşteri “Özel tarih” butonuna bastığında göreceği mesajlar. {`{start}`}, {`{end}`} = mesai saatleri, {`{tarih}`} = seçilen gün/saat.</p>
-                <div className="settings-row settings-messages-row">
-                  <label>
-                    <span>Gün/saat seçim istemi</span>
-                    <textarea value={mesajOzelTarihIstek} onChange={(e) => setMesajOzelTarihIstek(e.target.value)} rows={2} placeholder="Aranma zamanı seçin (mesai: {start}-{end})" />
-                  </label>
-                  <label>
-                    <span>Onay mesajı</span>
-                    <textarea value={mesajOzelTarihOnay} onChange={(e) => setMesajOzelTarihOnay(e.target.value)} rows={2} placeholder="Tercihiniz kaydedildi. {tarih} tarihinde sizi arayacağız." />
-                  </label>
-                </div>
-              </section>
-
-              {settingsSaveError && <p className="error">{settingsSaveError}</p>}
-              {settingsSaveSuccess && <p className="success">Ayarlar kaydedildi.</p>}
-              <button type="submit" className="lead-btn lead-btn-primary">Kaydet</button>
+              {settingsSaveError && <p className="settings-error">{settingsSaveError}</p>}
+              {settingsSaveSuccess && <p className="settings-success">Ayarlar kaydedildi.</p>}
             </form>
           )}
         </div>
