@@ -80,6 +80,8 @@ const STATUS_LABELS: Record<string, string> = {
   teklif_gonderildi: 'Teklif Gönderildi',
   arama_bekliyor: 'Aranma Bekleniyor',
   completed: 'Tamamlandı',
+  cancelled: 'İptal edildi',
+  timeout_cancelled: 'Otomatik iptal edildi',
 }
 
 function formatDate(ts: number) {
@@ -225,7 +227,7 @@ function useApi(token: string | null) {
     return res.json()
   }, [token])
 
-  type Settings = { mesai_baslangic: string; mesai_bitis: string; mesai_gunler: string; mesaj_hemen_mesai_ici?: string; mesaj_hemen_mesai_dis?: string; mesaj_ozel_tarih_istek?: string; mesaj_ozel_tarih_onay?: string; conversation_saklama_gunu?: string }
+  type Settings = { mesai_baslangic: string; mesai_bitis: string; mesai_gunler: string; mesaj_hemen_mesai_ici?: string; mesaj_hemen_mesai_dis?: string; mesaj_ozel_tarih_istek?: string; mesaj_ozel_tarih_onay?: string; conversation_saklama_gunu?: string; state_timeout_dakika?: string; state_uyari_dakika?: string; state_uyari_mesaj?: string; state_iptal_mesaj?: string; isletme_adi?: string; isletme_logo_url?: string }
   const fetchSettings = useCallback(async (): Promise<Settings> => {
     if (!token) throw new Error('Unauthorized')
     const res = await fetch(`${API_BASE}/api/settings`, { headers: headers() })
@@ -699,6 +701,12 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
   const [mesajOzelTarihIstek, setMesajOzelTarihIstek] = useState('')
   const [mesajOzelTarihOnay, setMesajOzelTarihOnay] = useState('')
   const [conversationSaklamaGunu, setConversationSaklamaGunu] = useState('30')
+  const [stateTimeoutDakika, setStateTimeoutDakika] = useState('1440')
+  const [stateUyariDakika, setStateUyariDakika] = useState('5')
+  const [stateUyariMesaj, setStateUyariMesaj] = useState('')
+  const [stateIptalMesaj, setStateIptalMesaj] = useState('')
+  const [isletmeAdi, setIsletmeAdi] = useState('Sigorta Admin')
+  const [isletmeLogoUrl, setIsletmeLogoUrl] = useState('')
 
   const filteredLeads = useMemo(() => {
     let list = leads
@@ -858,6 +866,15 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
   }, [load])
 
   useEffect(() => {
+    fetchSettings()
+      .then((s) => {
+        setIsletmeAdi(s.isletme_adi ?? 'Sigorta Admin')
+        setIsletmeLogoUrl(s.isletme_logo_url ?? '')
+      })
+      .catch(() => {})
+  }, [fetchSettings])
+
+  useEffect(() => {
     if (tab !== 'leads') return
     const interval = setInterval(() => load({ silent: true }), 10000)
     return () => clearInterval(interval)
@@ -885,6 +902,12 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
         setMesajOzelTarihIstek(ozelIstek)
         setMesajOzelTarihOnay(s.mesaj_ozel_tarih_onay ?? '')
         setConversationSaklamaGunu(s.conversation_saklama_gunu ?? '30')
+        setStateTimeoutDakika(s.state_timeout_dakika ?? '1440')
+        setStateUyariDakika(s.state_uyari_dakika ?? '5')
+        setStateUyariMesaj(s.state_uyari_mesaj ?? '')
+        setStateIptalMesaj(s.state_iptal_mesaj ?? '')
+        setIsletmeAdi(s.isletme_adi ?? 'Sigorta Admin')
+        setIsletmeLogoUrl(s.isletme_logo_url ?? '')
       })
       .catch(() => setSettingsSaveError('Ayarlar yüklenemedi'))
       .finally(() => setSettingsLoading(false))
@@ -894,7 +917,7 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
     setSettingsSaveError('')
     setSettingsSaveSuccess(false)
     try {
-      await saveSettings({
+      const saved = await saveSettings({
         mesai_baslangic: mesaiBaslangic,
         mesai_bitis: mesaiBitis,
         mesai_gunler: mesaiGunler.sort((a, b) => a - b).join(','),
@@ -903,7 +926,15 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
         mesaj_ozel_tarih_istek: mesajOzelTarihIstek,
         mesaj_ozel_tarih_onay: mesajOzelTarihOnay,
         conversation_saklama_gunu: conversationSaklamaGunu,
+        state_timeout_dakika: stateTimeoutDakika,
+        state_uyari_dakika: stateUyariDakika,
+        state_uyari_mesaj: stateUyariMesaj,
+        state_iptal_mesaj: stateIptalMesaj,
+        isletme_adi: isletmeAdi,
+        isletme_logo_url: isletmeLogoUrl,
       })
+      if (saved.isletme_adi !== undefined) setIsletmeAdi(saved.isletme_adi || 'Sigorta Admin')
+      if (saved.isletme_logo_url !== undefined) setIsletmeLogoUrl(saved.isletme_logo_url || '')
       setSettingsSaveSuccess(true)
       setTimeout(() => setSettingsSaveSuccess(false), 3000)
     } catch (err) {
@@ -914,7 +945,12 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
   return (
     <div className="dashboard">
       <header>
-        <h1>Sigorta Admin</h1>
+        <div className="header-brand">
+          {isletmeLogoUrl ? (
+            <img src={isletmeLogoUrl} alt={isletmeAdi} className="header-logo" />
+          ) : null}
+          <h1>{isletmeAdi}</h1>
+        </div>
         <div className="header-actions">
           <ThemeToggle theme={theme} setTheme={setTheme} />
           <button type="button" onClick={() => load()} disabled={loading}>Yenile</button>
@@ -1003,7 +1039,7 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
                             <span className="lead-card-plaka">{plaka}</span>
                             <span className="lead-card-date" title={formatDate(row.createdAt)}>{formatRelativeTime(row.createdAt)}</span>
                           </div>
-                          <span className={`lead-card-status ${row.status === 'fiyat_bekleniyor' || row.status === 'arama_bekliyor' ? 'lead-card-status-warning' : ''}`}>
+                          <span className={`lead-card-status ${row.status === 'fiyat_bekleniyor' || row.status === 'arama_bekliyor' ? 'lead-card-status-warning' : row.status === 'cancelled' || row.status === 'timeout_cancelled' ? 'lead-card-status-cancelled' : ''}`}>
                             {statusLabel}
                           </span>
                         </div>
@@ -1042,6 +1078,24 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
             <p className="settings-loading">Yükleniyor…</p>
           ) : (
             <form className="settings-form" onSubmit={(e) => { e.preventDefault(); handleSaveSettings(); }}>
+              <article className="settings-card settings-card-brand">
+                <header className="settings-card-header">
+                  <h2>İşletme / marka</h2>
+                  <p className="settings-card-desc">Admin panel başlığında görünecek. Satış aşamasında her işletme kendi adı ve logosuyla gösterilir.</p>
+                </header>
+                <div className="settings-card-body">
+                  <div className="settings-field">
+                    <label className="settings-field-label">İşletme adı</label>
+                    <input type="text" className="settings-input" value={isletmeAdi} onChange={(e) => setIsletmeAdi(e.target.value)} placeholder="Sigorta Admin" />
+                  </div>
+                  <div className="settings-field">
+                    <label className="settings-field-label">Logo URL</label>
+                    <input type="url" className="settings-input" value={isletmeLogoUrl} onChange={(e) => setIsletmeLogoUrl(e.target.value)} placeholder="https://..." />
+                    <span className="settings-field-hint">Önerilen: 140×40 px veya oranına uygun. Boş bırakırsanız sadece isim gösterilir.</span>
+                  </div>
+                  <button type="button" className="lead-btn lead-btn-primary settings-card-save" onClick={handleSaveSettings}>Kaydet</button>
+                </div>
+              </article>
               <div className="settings-grid">
                 <article className="settings-card">
                   <header className="settings-card-header">
@@ -1120,6 +1174,34 @@ function Dashboard({ token, onLogout, theme, setTheme }: { token: string; onLogo
                         </label>
                       ))}
                     </div>
+                  </div>
+                  <button type="button" className="lead-btn lead-btn-primary settings-card-save" onClick={handleSaveSettings}>Kaydet</button>
+                </div>
+              </article>
+
+              <article className="settings-card">
+                <header className="settings-card-header">
+                  <h2>İşlem zaman aşımı</h2>
+                  <p className="settings-card-desc">Müşteri teklif akışında yanıt vermezse işlem otomatik iptal edilir. İptalden önce uyarı mesajı gönderilir.</p>
+                </header>
+                <div className="settings-card-body">
+                  <div className="settings-field">
+                    <label className="settings-field-label">İşlem iptal süresi (dakika)</label>
+                    <input type="number" min={5} max={10080} value={stateTimeoutDakika} onChange={(e) => setStateTimeoutDakika(e.target.value)} placeholder="1440" className="settings-time-input" style={{ maxWidth: '120px' }} title="1440 = 24 saat" />
+                    <span className="settings-field-hint">1440 = 24 saat, 60 = 1 saat</span>
+                  </div>
+                  <div className="settings-field">
+                    <label className="settings-field-label">Uyarı mesajı – iptalden kaç dakika önce</label>
+                    <input type="number" min={1} max={120} value={stateUyariDakika} onChange={(e) => setStateUyariDakika(e.target.value)} placeholder="5" className="settings-time-input" style={{ maxWidth: '80px' }} />
+                  </div>
+                  <div className="settings-field">
+                    <label className="settings-field-label">Uyarı mesajı metni</label>
+                    <textarea className="settings-textarea" value={stateUyariMesaj} onChange={(e) => setStateUyariMesaj(e.target.value)} rows={2} placeholder="Devam etmezseniz {dakika} dakika içinde işleminiz sonlanacaktır." />
+                    <span className="settings-field-hint"><code>{'{dakika}'}</code> = uyarı dakikası</span>
+                  </div>
+                  <div className="settings-field">
+                    <label className="settings-field-label">İptal mesajı</label>
+                    <textarea className="settings-textarea" value={stateIptalMesaj} onChange={(e) => setStateIptalMesaj(e.target.value)} rows={2} placeholder="İşleminiz zaman aşımına uğradı. Yeniden başlayabilirsiniz." />
                   </div>
                   <button type="button" className="lead-btn lead-btn-primary settings-card-save" onClick={handleSaveSettings}>Kaydet</button>
                 </div>

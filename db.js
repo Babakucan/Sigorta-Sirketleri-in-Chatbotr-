@@ -74,6 +74,18 @@ db.exec(`
   )
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS chat_states (
+    chat_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    lead_id INTEGER,
+    extra TEXT,
+    updated_at INTEGER NOT NULL,
+    warning_sent_at INTEGER
+  )
+`);
+try { db.exec("ALTER TABLE chat_states ADD COLUMN warning_sent_at INTEGER"); } catch (_) {}
+
 const defaultPackages = [
   { key: "pkg_eko", name: "Ekonomik", description: "Çarpışma, yangın, hırsızlık. Temel kapsam.", label: "Ekonomik kapsam", price: 0, discount_percent: 0, sort_order: 1 },
   { key: "pkg_genis", name: "Standart (Önerilen)", description: "İkame araç, yol yardımı, cam muafiyeti, mini onarım dahil.", label: "Önerilen", price: 0, discount_percent: 0, sort_order: 2 },
@@ -97,6 +109,12 @@ const defaultSettings = [
   { key: "mesaj_ozel_tarih_istek", value: "Aranma zamanı seçin (mesai: {start}-{end})" },
   { key: "mesaj_ozel_tarih_onay", value: "Tercihiniz kaydedildi. {tarih} tarihinde sizi arayacağız." },
   { key: "conversation_saklama_gunu", value: "30" },
+  { key: "state_timeout_dakika", value: "1440" },
+  { key: "state_uyari_dakika", value: "5" },
+  { key: "state_uyari_mesaj", value: "Devam etmezseniz {dakika} dakika içinde işleminiz sonlanacaktır." },
+  { key: "state_iptal_mesaj", value: "İşleminiz zaman aşımına uğradı. Yeniden başlayabilirsiniz." },
+  { key: "isletme_adi", value: "Sigorta Admin" },
+  { key: "isletme_logo_url", value: "" },
 ];
 defaultSettings.forEach(({ key, value }) => {
   try {
@@ -123,6 +141,56 @@ function getLeads(limit = 200) {
 function hasAnyLeadForChat(chatId) {
   const row = db.prepare("SELECT 1 FROM leads WHERE chat_id = ? LIMIT 1").get(String(chatId));
   return !!row;
+}
+
+function getChatStateFromDb(chatId) {
+  const row = db.prepare("SELECT mode, lead_id, extra, updated_at, warning_sent_at FROM chat_states WHERE chat_id = ?").get(String(chatId));
+  if (!row) return null;
+  const state = { mode: row.mode, leadId: row.lead_id, updatedAt: row.updated_at, warningSentAt: row.warning_sent_at };
+  if (row.extra) {
+    try {
+      const extra = JSON.parse(row.extra);
+      if (extra.plateGuess != null) state.plateGuess = extra.plateGuess;
+    } catch (_) {}
+  }
+  return state;
+}
+
+function setChatStateInDb(chatId, state) {
+  const cid = String(chatId);
+  if (!state) {
+    db.prepare("DELETE FROM chat_states WHERE chat_id = ?").run(cid);
+    return;
+  }
+  const extra = {};
+  if (state.plateGuess != null) extra.plateGuess = state.plateGuess;
+  const extraStr = Object.keys(extra).length ? JSON.stringify(extra) : null;
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO chat_states (chat_id, mode, lead_id, extra, updated_at, warning_sent_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(chat_id) DO UPDATE SET mode=excluded.mode, lead_id=excluded.lead_id, extra=excluded.extra, updated_at=excluded.updated_at
+  `).run(cid, state.mode, state.leadId || null, extraStr, now, null);
+}
+
+function markChatStateWarningSent(chatId) {
+  db.prepare("UPDATE chat_states SET warning_sent_at = ? WHERE chat_id = ?").run(Date.now(), String(chatId));
+}
+
+function getAllActiveChatStates() {
+  return db.prepare("SELECT chat_id, mode, lead_id, extra, updated_at, warning_sent_at FROM chat_states").all();
+}
+
+/** Daha önce sohbet etti mi (conversations'da bot mesajı var mı). Lead olmadan sadece menüye bakanları da tanır. */
+function hasChattedBefore(chatId) {
+  const row = db.prepare("SELECT 1 FROM conversations WHERE chat_id = ? AND role = 'bot' LIMIT 1").get(String(chatId));
+  return !!row;
+}
+
+/** Chat için son lead'in adı (kişiselleştirilmiş karşılama için). */
+function getLastFirstNameForChat(chatId) {
+  const row = db.prepare("SELECT first_name FROM leads WHERE chat_id = ? AND first_name IS NOT NULL AND first_name != '' ORDER BY created_at DESC LIMIT 1").get(String(chatId));
+  return row?.first_name?.trim() || null;
 }
 
 function mapRowToLead(row) {
@@ -335,6 +403,12 @@ module.exports = {
   getLeads,
   getLeadById,
   hasAnyLeadForChat,
+  hasChattedBefore,
+  getLastFirstNameForChat,
+  getChatStateFromDb,
+  setChatStateInDb,
+  markChatStateWarningSent,
+  getAllActiveChatStates,
   insertLead,
   updateLead,
   getConversations,
