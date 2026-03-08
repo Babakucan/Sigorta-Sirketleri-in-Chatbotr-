@@ -199,6 +199,22 @@ body {
 .header-actions .theme-toggle {
   box-shadow: none;
 }
+.header-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.header-logo {
+  display: block;
+  height: 40px;
+  width: auto;
+  min-width: 0;
+  max-width: 140px;
+  max-height: 40px;
+  object-fit: contain;
+  object-position: left center;
+  flex-shrink: 0;
+}
 .dashboard header h1 {
   font-size: 1.5rem;
   font-weight: 700;
@@ -408,6 +424,19 @@ button.outline:hover { background: var(--surface-hover); color: var(--text); bor
   letter-spacing: 0.02em;
   text-align: center;
 }
+.settings-field-hint {
+  font-size: 0.75rem;
+  color: var(--muted);
+  opacity: 0.9;
+  text-align: center;
+  margin-top: 0.25rem;
+}
+.settings-field-hint code {
+  background: rgba(0,0,0,0.08);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
 
 .settings-textarea {
   width: 100%;
@@ -487,6 +516,17 @@ button.outline:hover { background: var(--surface-hover); color: var(--text); bor
   min-width: 120px;
 }
 .settings-time-input:focus { outline: none; border-color: var(--accent); }
+.settings-input {
+  width: 100%;
+  padding: 0.6rem 1rem;
+  font-size: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--input-bg);
+  color: var(--text);
+  font-family: inherit;
+}
+.settings-input:focus { outline: none; border-color: var(--accent); }
 .settings-mesai-sep {
   font-size: 1.1rem;
   font-weight: 600;

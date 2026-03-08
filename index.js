@@ -8,7 +8,7 @@ console.log("[Boot] index.js " + new Date().toISOString());
 
 const express = require("express");
 const { Telegraf, Markup } = require("telegraf");
-const { getLeads, getLeadById, insertLead, updateLead, getConversations, addConversation, getPackages, updatePackage, insertPackage, getSetting, setSetting, getOrAssignVariant, hasAnyLeadForChat } = require("./db");
+const { getLeads, getLeadById, insertLead, updateLead, getConversations, addConversation, getPackages, updatePackage, insertPackage, getSetting, setSetting, getOrAssignVariant, hasAnyLeadForChat, hasChattedBefore, getLastFirstNameForChat, getChatStateFromDb, setChatStateInDb, markChatStateWarningSent, getAllActiveChatStates } = require("./db");
 const { extractRuhsatFromImage, syncLeadFieldsFromRuhsat } = require("./lib/ruhsat");
 const { sendAndTrackTelegram, runTelegramMessageCleanup } = require("./lib/telegram");
 
@@ -49,7 +49,35 @@ if (!fs.existsSync(UPLOAD_DIR)) {
    process.exit(1);
  }
 
- const chatStates = {};
+/** State cache (same request için) - DB'den okunan state burada tutulur, böylece aynı handler içinde tekrar DB'ye gitmeyiz. */
+const chatStates = {};
+
+function getChatState(chatId) {
+  let s = chatStates[chatId];
+  if (s === undefined) {
+    const fromDb = getChatStateFromDb(chatId);
+    if (!fromDb) return null;
+    const timeoutMin = Number(getSetting("state_timeout_dakika")) || 1440;
+    const timeoutMs = timeoutMin * 60 * 1000;
+    if (Date.now() - fromDb.updatedAt > timeoutMs) {
+      setChatStateInDb(chatId, null);
+      return null;
+    }
+    s = { mode: fromDb.mode, leadId: fromDb.leadId, plateGuess: fromDb.plateGuess };
+    chatStates[chatId] = s;
+  }
+  return s;
+}
+
+function setChatState(chatId, state) {
+  if (!state) {
+    delete chatStates[chatId];
+    setChatStateInDb(chatId, null);
+  } else {
+    chatStates[chatId] = state;
+    setChatStateInDb(chatId, state);
+  }
+}
 
 /** Aynı fotoğraf tekrar gönderildiğinde AI maliyetini önlemek: (chatId:file_unique_id) -> { leadId, ruhsatData, timestamp } */
 const photoCache = new Map();
@@ -297,11 +325,17 @@ app.get("/api/settings", apiAuth, (req, res) => {
     mesaj_ozel_tarih_istek: getSetting("mesaj_ozel_tarih_istek") || "Aranma zamanı seçin (mesai: {start}-{end})",
     mesaj_ozel_tarih_onay: getSetting("mesaj_ozel_tarih_onay") || "Tercihiniz kaydedildi. {tarih} tarihinde sizi arayacağız.",
     conversation_saklama_gunu: getSetting("conversation_saklama_gunu") || "30",
+    state_timeout_dakika: getSetting("state_timeout_dakika") || "1440",
+    state_uyari_dakika: getSetting("state_uyari_dakika") || "5",
+    state_uyari_mesaj: getSetting("state_uyari_mesaj") || "Devam etmezseniz {dakika} dakika içinde işleminiz sonlanacaktır.",
+    state_iptal_mesaj: getSetting("state_iptal_mesaj") || "İşleminiz zaman aşımına uğradı. Yeniden başlayabilirsiniz.",
+    isletme_adi: getSetting("isletme_adi") || "Sigorta Admin",
+    isletme_logo_url: getSetting("isletme_logo_url") || "",
   });
 });
 
 app.put("/api/settings", apiAuth, (req, res) => {
-  const { mesai_baslangic, mesai_bitis, mesai_gunler, mesaj_hemen_mesai_ici, mesaj_hemen_mesai_dis, mesaj_ozel_tarih_istek, mesaj_ozel_tarih_onay, conversation_saklama_gunu } = req.body || {};
+  const { mesai_baslangic, mesai_bitis, mesai_gunler, mesaj_hemen_mesai_ici, mesaj_hemen_mesai_dis, mesaj_ozel_tarih_istek, mesaj_ozel_tarih_onay, conversation_saklama_gunu, state_timeout_dakika, state_uyari_dakika, state_uyari_mesaj, state_iptal_mesaj, isletme_adi, isletme_logo_url } = req.body || {};
   if (mesai_baslangic !== undefined) setSetting("mesai_baslangic", mesai_baslangic);
   if (mesai_bitis !== undefined) setSetting("mesai_bitis", mesai_bitis);
   if (mesai_gunler !== undefined) setSetting("mesai_gunler", mesai_gunler);
@@ -310,6 +344,12 @@ app.put("/api/settings", apiAuth, (req, res) => {
   if (mesaj_ozel_tarih_istek !== undefined) setSetting("mesaj_ozel_tarih_istek", mesaj_ozel_tarih_istek);
   if (mesaj_ozel_tarih_onay !== undefined) setSetting("mesaj_ozel_tarih_onay", mesaj_ozel_tarih_onay);
   if (conversation_saklama_gunu !== undefined) setSetting("conversation_saklama_gunu", String(conversation_saklama_gunu));
+  if (state_timeout_dakika !== undefined) setSetting("state_timeout_dakika", String(state_timeout_dakika));
+  if (state_uyari_dakika !== undefined) setSetting("state_uyari_dakika", String(state_uyari_dakika));
+  if (state_uyari_mesaj !== undefined) setSetting("state_uyari_mesaj", state_uyari_mesaj);
+  if (state_iptal_mesaj !== undefined) setSetting("state_iptal_mesaj", state_iptal_mesaj);
+  if (isletme_adi !== undefined) setSetting("isletme_adi", String(isletme_adi));
+  if (isletme_logo_url !== undefined) setSetting("isletme_logo_url", String(isletme_logo_url || ""));
   res.json({
     mesai_baslangic: getSetting("mesai_baslangic") || "09:00",
     mesai_bitis: getSetting("mesai_bitis") || "18:00",
@@ -319,6 +359,12 @@ app.put("/api/settings", apiAuth, (req, res) => {
     mesaj_ozel_tarih_istek: getSetting("mesaj_ozel_tarih_istek") || "Aranma zamanı seçin (mesai: {start}-{end})",
     mesaj_ozel_tarih_onay: getSetting("mesaj_ozel_tarih_onay") || "Tercihiniz kaydedildi. {tarih} tarihinde sizi arayacağız.",
     conversation_saklama_gunu: getSetting("conversation_saklama_gunu") || "30",
+    state_timeout_dakika: getSetting("state_timeout_dakika") || "1440",
+    state_uyari_dakika: getSetting("state_uyari_dakika") || "5",
+    state_uyari_mesaj: getSetting("state_uyari_mesaj") || "Devam etmezseniz {dakika} dakika içinde işleminiz sonlanacaktır.",
+    state_iptal_mesaj: getSetting("state_iptal_mesaj") || "İşleminiz zaman aşımına uğradı. Yeniden başlayabilirsiniz.",
+    isletme_adi: getSetting("isletme_adi") || "Sigorta Admin",
+    isletme_logo_url: getSetting("isletme_logo_url") || "",
   });
 });
 
@@ -463,14 +509,6 @@ function findLeadById(id) {
   return getLeadById(id);
 }
 
-function setChatState(chatId, state) {
-  if (!state) {
-    delete chatStates[chatId];
-  } else {
-    chatStates[chatId] = state;
-  }
-}
-
 /** Manuel giriş validasyonu: Plaka — boşlukları sil, büyük harfe çevir; en az 5 karakter (örn. 34ABC123, 06ANK06). */
 function normalizeAndValidatePlate(input) {
   if (!input || typeof input !== "string") return null;
@@ -521,9 +559,11 @@ const MENU_TEXT_WELCOME =
   "Merhaba! 🚗 Araç sigortası dijital asistanına hoş geldiniz.\n\n" +
   "Size nasıl yardımcı olabilirim? Teklif almak, hasar bildirimi veya canlı destek için aşağıdaki menüden seçim yapabilirsiniz. 😊";
 
-const MENU_TEXT_RETURNING =
-  "Tekrar hoş geldiniz! 😊 Size nasıl yardımcı olabilirim?\n\n" +
-  "Lütfen aşağıdan bir işlem seçin.";
+function getMenuTextReturning(chatId) {
+  const firstName = getLastFirstNameForChat(chatId);
+  const greeting = firstName ? `Tekrar hoş geldiniz ${firstName}! 😊` : "Tekrar hoş geldiniz! 😊";
+  return greeting + " Size nasıl yardımcı olabilirim?\n\nLütfen aşağıdan bir işlem seçin.";
+}
 
  function menuInlineKeyboard() {
    return Markup.inlineKeyboard([
@@ -545,7 +585,7 @@ const MENU_TEXT_RETURNING =
  }
 
  function cancelLeadAndClearState(chatId) {
-   const state = chatStates[chatId];
+   const state = getChatState(chatId);
    if (state && state.leadId) {
      const lead = getLeadById(state.leadId);
      if (lead && (String(lead.chatId) === String(chatId) || lead.chatId == chatId)) {
@@ -558,8 +598,8 @@ const MENU_TEXT_RETURNING =
  bot.start((ctx) => {
    const chatId = ctx.chat.id;
    addMessage(chatId, "user", "/start");
-   const isFirstTime = !hasAnyLeadForChat(chatId);
-   const menuText = isFirstTime ? MENU_TEXT_WELCOME : MENU_TEXT_RETURNING;
+   const isReturning = hasAnyLeadForChat(chatId) || hasChattedBefore(chatId);
+   const menuText = isReturning ? getMenuTextReturning(chatId) : MENU_TEXT_WELCOME;
    addMessage(chatId, "bot", menuText);
    return sendAndTrackTelegram(ctx.telegram, ctx.chat.id, menuText, menuInlineKeyboard());
  });
@@ -697,7 +737,7 @@ const MENU_TEXT_RETURNING =
    }
 
    if (data === "teklif_yontem_yaz") {
-     if (isInFlow(chatStates[chatId])) {
+     if (isInFlow(getChatState(chatId))) {
        const reply = "Şu anda devam eden bir işleminiz var. İptal edip yeni işleme geçmek ister misiniz?";
        addMessage(chatId, "bot", reply);
        await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard([
@@ -723,7 +763,7 @@ const MENU_TEXT_RETURNING =
     return;
    }
    if (data === "teklif_yontem_ruhsat") {
-     if (isInFlow(chatStates[chatId])) {
+     if (isInFlow(getChatState(chatId))) {
        const reply = "Şu anda devam eden bir işleminiz var. İptal edip yeni işleme geçmek ister misiniz?";
        addMessage(chatId, "bot", reply);
        await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard([
@@ -751,8 +791,9 @@ const MENU_TEXT_RETURNING =
 
   if (data === "main_menu") {
     cancelLeadAndClearState(chatId);
-    addMessage(chatId, "bot", MENU_TEXT_RETURNING);
-     await sendAndTrackTelegram(ctx.telegram, chatId, MENU_TEXT_RETURNING, menuInlineKeyboard());
+    const menuText = getMenuTextReturning(chatId);
+    addMessage(chatId, "bot", menuText);
+    await sendAndTrackTelegram(ctx.telegram, chatId, menuText, menuInlineKeyboard());
      return;
    }
 
@@ -776,7 +817,7 @@ const MENU_TEXT_RETURNING =
   if (data.startsWith("confirm_plate_evet_")) {
     const leadId = parseInt(data.replace("confirm_plate_evet_", ""), 10);
     const lead = leadId ? getLeadById(leadId) : null;
-    const state = chatStates[chatId];
+    const state = getChatState(chatId);
     const plateGuess = state?.plateGuess;
     if (lead && (String(lead.chatId) === String(chatId) || lead.chatId == chatId) && plateGuess) {
       lead.plate = plateGuess;
@@ -895,7 +936,7 @@ const MENU_TEXT_RETURNING =
    }
 
    if (data === "menu_1") {
-     const state = chatStates[chatId];
+     const state = getChatState(chatId);
      if (isInFlow(state)) {
        const reply = "Şu anda devam eden bir işleminiz var. İptal edip yeni işleme geçmek ister misiniz?";
        addMessage(chatId, "bot", reply);
@@ -917,7 +958,7 @@ const MENU_TEXT_RETURNING =
      return;
    }
    if (data === "menu_2") {
-     const state = chatStates[chatId];
+     const state = getChatState(chatId);
      if (isInFlow(state)) {
        const reply = "Şu anda devam eden bir işleminiz var. İptal edip yeni işleme geçmek ister misiniz?";
        addMessage(chatId, "bot", reply);
@@ -937,7 +978,7 @@ const MENU_TEXT_RETURNING =
      return;
    }
    if (data === "menu_3") {
-     const state = chatStates[chatId];
+     const state = getChatState(chatId);
      if (isInFlow(state)) {
        const reply = "Şu anda devam eden bir işleminiz var. İptal edip yeni işleme geçmek ister misiniz?";
        addMessage(chatId, "bot", reply);
@@ -953,7 +994,7 @@ const MENU_TEXT_RETURNING =
      return;
    }
    if (data === "menu_4") {
-     const state = chatStates[chatId];
+     const state = getChatState(chatId);
      if (isInFlow(state)) {
        const reply = "Şu anda devam eden bir işleminiz var. İptal edip yeni işleme geçmek ister misiniz?";
        addMessage(chatId, "bot", reply);
@@ -969,7 +1010,7 @@ const MENU_TEXT_RETURNING =
      return;
    }
    if (data === "menu_5") {
-     const state = chatStates[chatId];
+     const state = getChatState(chatId);
      if (isInFlow(state)) {
        const reply = "Şu anda devam eden bir işleminiz var. İptal edip yeni işleme geçmek ister misiniz?";
        addMessage(chatId, "bot", reply);
@@ -986,7 +1027,7 @@ const MENU_TEXT_RETURNING =
   }
 
    if (data.startsWith("pkg_")) {
-     const state = chatStates[chatId];
+     const state = getChatState(chatId);
      const lead = state?.leadId ? findLeadById(state.leadId) : null;
      if (!lead) return;
 
@@ -1034,7 +1075,7 @@ bot.on("text", async (ctx) => {
 
   const selamlar = ["merhaba", "selam", "hi", "hey", "günaydın", "iyi günler", "iyi akşamlar"];
   if (selamlar.some((s) => userText.trim().toLowerCase() === s)) {
-    const state = chatStates[chatId];
+    const state = getChatState(chatId);
     if (isInFlow(state)) {
       const reply = "Devam eden teklifiniz var. Menüye dönmek istediğinize emin misiniz? Mevcut işlem iptal olacak.";
       const keyboard = Markup.inlineKeyboard([
@@ -1046,14 +1087,14 @@ bot.on("text", async (ctx) => {
       return;
     }
     setChatState(chatId, null);
-    const isFirstTime = !hasAnyLeadForChat(chatId);
-    const menuText = isFirstTime ? MENU_TEXT_WELCOME : MENU_TEXT_RETURNING;
+    const isReturning = hasAnyLeadForChat(chatId) || hasChattedBefore(chatId);
+    const menuText = isReturning ? getMenuTextReturning(chatId) : MENU_TEXT_WELCOME;
     addMessage(chatId, "bot", menuText);
     await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, menuText, menuInlineKeyboard());
     return;
   }
 
-  const state = chatStates[chatId];
+  const state = getChatState(chatId);
 
   if (state && state.mode === "ask_name") {
     const fullName = userText.trim();
@@ -1639,7 +1680,7 @@ bot.on("photo", async (ctx) => {
     filePath: savedPath,
   });
 
-  const existingState = chatStates[chatId];
+  const existingState = getChatState(chatId);
   let lead;
   if (existingState && existingState.mode === "ask_plate" && existingState.leadId) {
     lead = findLeadById(existingState.leadId);
@@ -1720,6 +1761,58 @@ bot.on("photo", async (ctx) => {
   }
 });
 
+let _stateTimeoutTickCount = 0;
+async function runStateTimeoutCheck() {
+  _stateTimeoutTickCount++;
+  const states = getAllActiveChatStates();
+  if (states.length === 0) {
+    if (_stateTimeoutTickCount <= 3 || _stateTimeoutTickCount % 20 === 0) {
+      console.log("[state-timeout] Çalışıyor, chat_states boş (%d. kontrol)", _stateTimeoutTickCount);
+    }
+    return;
+  }
+  const timeoutMin = Number(getSetting("state_timeout_dakika")) || 1440;
+  let uyariMin = Number(getSetting("state_uyari_dakika")) || 5;
+  const uyariMesaj = getSetting("state_uyari_mesaj") || "Devam etmezseniz {dakika} dakika içinde işleminiz sonlanacaktır.";
+  const iptalMesaj = getSetting("state_iptal_mesaj") || "İşleminiz zaman aşımına uğradı. Yeniden başlayabilirsiniz.";
+  const now = Date.now();
+  const timeoutMs = timeoutMin * 60 * 1000;
+  let uyariMs = uyariMin * 60 * 1000;
+  if (uyariMs > timeoutMs) uyariMs = timeoutMs; // uyarı süresi timeout'tan uzun olamaz
+  if (states.length > 0) console.log("[state-timeout] Kontrol: %d sohbet, iptal=%d dk, uyarı=%d dk önce", states.length, timeoutMin, Math.round(uyariMs / 60000));
+  for (const row of states) {
+    const chatId = row.chat_id;
+    const updatedAt = row.updated_at;
+    const warningSentAt = row.warning_sent_at;
+    const elapsed = now - updatedAt;
+    if (elapsed >= timeoutMs) {
+      const leadId = row.lead_id;
+      if (leadId) {
+        const lead = getLeadById(leadId);
+        if (lead && (String(lead.chatId) === String(chatId) || lead.chatId == chatId)) {
+          updateLead(leadId, { status: "timeout_cancelled" });
+        }
+      }
+      setChatStateInDb(chatId, null);
+      delete chatStates[chatId];
+      try {
+        addMessage(chatId, "bot", iptalMesaj);
+        await sendAndTrackTelegram(bot.telegram, chatId, iptalMesaj, menuInlineKeyboard());
+        console.log("[state-timeout] İptal:", chatId);
+      } catch (e) { console.warn("[state-timeout] İptal mesaj:", e?.message); }
+    } else if (elapsed >= timeoutMs - uyariMs && !warningSentAt) {
+      markChatStateWarningSent(chatId);
+      const dakikaGoster = Math.round(uyariMs / 60000);
+      const msg = uyariMesaj.replace(/\{dakika\}/g, String(dakikaGoster));
+      try {
+        addMessage(chatId, "bot", msg);
+        await sendAndTrackTelegram(bot.telegram, chatId, msg);
+        console.log("[state-timeout] Uyarı:", chatId);
+      } catch (e) { console.warn("[state-timeout] Uyarı mesaj:", e?.message); }
+    }
+  }
+}
+
 bot.launch().then(async () => {
    console.log("Telegram bot started.");
    try { await runTelegramMessageCleanup(bot.telegram); } catch (e) { console.warn("[telegram] Başlangıç temizliği:", e?.message); }
@@ -1731,5 +1824,8 @@ bot.launch().then(async () => {
    console.log(`Server: http://localhost:${PORT}  ve  http://127.0.0.1:${PORT}`);
    console.log(`Admin panel: http://127.0.0.1:${PORT}/app/`);
    console.log("(Bu terminali kapatmayin.)");
-  console.log("Baglanamazsan: 1) Adres olarak http://127.0.0.1:" + PORT + "/app/ ac. 2) Opera yerine Chrome/Edge dene. 3) .env icinde PORT=3001 yazip tekrar baslat.");
+   console.log("Baglanamazsan: 1) Adres olarak http://127.0.0.1:" + PORT + "/app/ ac. 2) Opera yerine Chrome/Edge dene. 3) .env icinde PORT=3001 yazip tekrar baslat.");
+   console.log("[state-timeout] Scheduler başlatıldı.");
+   runStateTimeoutCheck().catch((e) => console.warn("[state-timeout] ilk:", e?.message));
+   setInterval(() => { runStateTimeoutCheck().catch((e) => console.warn("[state-timeout]", e?.message)); }, 15 * 1000);
  });
