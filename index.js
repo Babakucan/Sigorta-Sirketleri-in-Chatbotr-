@@ -257,6 +257,13 @@ const STATUS_LABELS = {
   cancelled: "İptal edildi",
 };
 
+function getTextSetting(key, fallback) {
+  const raw = getSetting(key);
+  if (raw == null) return fallback;
+  const s = String(raw).trim();
+  return s ? s : fallback;
+}
+
 const GUN_ADLARI = ["Pazar", "Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi"];
 
 function getMesaiSettings() {
@@ -450,11 +457,32 @@ app.get("/api/settings", apiAuth, (req, res) => {
     state_iptal_mesaj: getSetting("state_iptal_mesaj") || "İşleminiz zaman aşımına uğradı. Yeniden başlayabilirsiniz.",
     isletme_adi: getSetting("isletme_adi") || "Sigorta Admin",
     isletme_logo_url: getSetting("isletme_logo_url") || "",
+    msg_welcome_new: getSetting("msg_welcome_new") || "",
+    msg_welcome_returning: getSetting("msg_welcome_returning") || "",
+    msg_fallback_menu: getSetting("msg_fallback_menu") || "",
   });
 });
 
 app.put("/api/settings", apiAuth, (req, res) => {
-  const { mesai_baslangic, mesai_bitis, mesai_gunler, mesaj_hemen_mesai_ici, mesaj_hemen_mesai_dis, mesaj_ozel_tarih_istek, mesaj_ozel_tarih_onay, conversation_saklama_gunu, state_timeout_dakika, state_uyari_dakika, state_uyari_mesaj, state_iptal_mesaj, isletme_adi, isletme_logo_url } = req.body || {};
+  const {
+    mesai_baslangic,
+    mesai_bitis,
+    mesai_gunler,
+    mesaj_hemen_mesai_ici,
+    mesaj_hemen_mesai_dis,
+    mesaj_ozel_tarih_istek,
+    mesaj_ozel_tarih_onay,
+    conversation_saklama_gunu,
+    state_timeout_dakika,
+    state_uyari_dakika,
+    state_uyari_mesaj,
+    state_iptal_mesaj,
+    isletme_adi,
+    isletme_logo_url,
+    msg_welcome_new,
+    msg_welcome_returning,
+    msg_fallback_menu,
+  } = req.body || {};
   if (mesai_baslangic !== undefined) setSetting("mesai_baslangic", mesai_baslangic);
   if (mesai_bitis !== undefined) setSetting("mesai_bitis", mesai_bitis);
   if (mesai_gunler !== undefined) setSetting("mesai_gunler", mesai_gunler);
@@ -469,6 +497,9 @@ app.put("/api/settings", apiAuth, (req, res) => {
   if (state_iptal_mesaj !== undefined) setSetting("state_iptal_mesaj", state_iptal_mesaj);
   if (isletme_adi !== undefined) setSetting("isletme_adi", String(isletme_adi));
   if (isletme_logo_url !== undefined) setSetting("isletme_logo_url", String(isletme_logo_url || ""));
+  if (msg_welcome_new !== undefined) setSetting("msg_welcome_new", String(msg_welcome_new || ""));
+  if (msg_welcome_returning !== undefined) setSetting("msg_welcome_returning", String(msg_welcome_returning || ""));
+  if (msg_fallback_menu !== undefined) setSetting("msg_fallback_menu", String(msg_fallback_menu || ""));
   res.json({
     mesai_baslangic: getSetting("mesai_baslangic") || "09:00",
     mesai_bitis: getSetting("mesai_bitis") || "18:00",
@@ -671,14 +702,26 @@ function nextMissingRuhsatField(lead) {
   return "marka_km";
 }
 
-const MENU_TEXT_WELCOME =
+const MENU_TEXT_WELCOME_DEFAULT =
   "Merhaba! 🚗 Araç sigortası dijital asistanına hoş geldiniz.\n\n" +
   "Size nasıl yardımcı olabilirim? Teklif almak, hasar bildirimi veya canlı destek için aşağıdaki menüden seçim yapabilirsiniz. 😊";
 
+function getWelcomeNewText() {
+  return getTextSetting("msg_welcome_new", MENU_TEXT_WELCOME_DEFAULT);
+}
+
 function getMenuTextReturning(chatId) {
   const firstName = getLastFirstNameForChat(chatId);
-  const greeting = firstName ? `Tekrar hoş geldiniz ${firstName}! 😊` : "Tekrar hoş geldiniz! 😊";
-  return greeting + " Size nasıl yardımcı olabilirim?\n\nLütfen aşağıdan bir işlem seçin.";
+  const defaultGreeting = firstName ? `Tekrar hoş geldiniz ${firstName}! 😊` : "Tekrar hoş geldiniz! 😊";
+  const template = getTextSetting(
+    "msg_welcome_returning",
+    "{greeting} Size nasıl yardımcı olabilirim?\n\nLütfen aşağıdan bir işlem seçin."
+  );
+  return template
+    .replace(/\{ad\}/g, firstName || "")
+    .replace(/\{isim\}/g, firstName || "")
+    .replace(/\{name\}/g, firstName || "")
+    .replace(/\{greeting\}/g, defaultGreeting);
 }
 
 const MENU_CHOICES = [
@@ -1220,8 +1263,10 @@ const MENU_OR_CANCEL_CHOICES = [
   userText = (userText || "").trim();
   addMessage(chatId, "user", userText);
 
+  const lower = userText.toLowerCase();
+
   const selamlar = ["merhaba", "selam", "hi", "hey", "günaydın", "iyi günler", "iyi akşamlar"];
-  if (selamlar.some((s) => userText.toLowerCase() === s)) {
+  if (selamlar.some((s) => lower === s)) {
     const state = getChatState(chatId);
     if (isInFlow(state)) {
       const reply = "Devam eden teklifiniz var. Menüye dönmek istediğinize emin misiniz? Mevcut işlem iptal olacak.";
@@ -1232,9 +1277,31 @@ const MENU_OR_CANCEL_CHOICES = [
     }
     setChatState(chatId, null);
     const isReturning = hasAnyLeadForChat(chatId) || hasChattedBefore(chatId);
-    const menuText = isReturning ? getMenuTextReturning(chatId) : MENU_TEXT_WELCOME;
+    const menuText = isReturning ? getMenuTextReturning(chatId) : getWelcomeNewText();
     addMessage(chatId, "bot", menuText);
     await sendToUser(chatId, menuText, MENU_CHOICES);
+    return;
+  }
+
+  // Kısa komutlar: /menu veya menü → ana menüye dön.
+  if (lower === "/menu" || lower === "menu" || lower === "menü") {
+    const isReturning = hasAnyLeadForChat(chatId) || hasChattedBefore(chatId);
+    const menuText = isReturning ? getMenuTextReturning(chatId) : getWelcomeNewText();
+    cancelLeadAndClearState(chatId);
+    addMessage(chatId, "bot", menuText);
+    await sendToUser(chatId, menuText, MENU_CHOICES);
+    return;
+  }
+
+  // Kısa komut: /iptal → devam eden akışı iptal et ve kullanıcıyı bilgilendir.
+  if (lower === "/iptal" || lower === "iptal") {
+    const stateBefore = getChatState(chatId);
+    cancelLeadAndClearState(chatId);
+    const reply = stateBefore
+      ? "Devam eden işleminiz iptal edildi. Yeni bir işlem başlatmak için menüden seçim yapabilirsiniz."
+      : "Aktif bir işleminiz bulunmuyor. Yeni bir işlem başlatmak için menüden seçim yapabilirsiniz.";
+    addMessage(chatId, "bot", reply);
+    await sendToUser(chatId, reply, MENU_CHOICES);
     return;
   }
 
@@ -1687,7 +1754,10 @@ const MENU_OR_CANCEL_CHOICES = [
   }
 
   // Fallback: sadece butonlar, tekrarlı liste yok
-  const reply = "Size nasıl yardımcı olabilirim? Aşağıdaki butonlardan seçin: 😊";
+  const reply = getTextSetting(
+    "msg_fallback_menu",
+    "Size nasıl yardımcı olabilirim? Aşağıdaki butonlardan seçin: 😊"
+  );
   addMessage(chatId, "bot", reply);
   await sendToUser(chatId, reply, MENU_CHOICES);
 }
