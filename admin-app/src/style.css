@@ -349,6 +349,165 @@ button.outline:hover { background: var(--surface-hover); color: var(--text); bor
 .leads-view-filters button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
 .leads-empty { color: var(--muted); padding: 2rem; text-align: center; }
 
+/* Yeni leads layout */
+.leads-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 260px) minmax(0, 1fr);
+  gap: 1.5rem;
+  align-items: flex-start;
+}
+
+@media (max-width: 960px) {
+  .leads-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.leads-sidebar {
+  background: var(--surface);
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  padding: 1rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.leads-sidebar-section + .leads-sidebar-section {
+  border-top: 1px solid rgba(148, 163, 184, 0.35);
+  padding-top: 1rem;
+  margin-top: 0.25rem;
+}
+
+.leads-sidebar-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin: 0 0 0.5rem;
+}
+
+.leads-metrics {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.leads-metric-card {
+  padding: 0.75rem 0.9rem;
+  border-radius: 12px;
+  background: radial-gradient(circle at top left, rgba(16, 185, 129, 0.12), transparent 55%),
+    var(--surface-hover);
+  border: 1px solid rgba(148, 163, 184, 0.4);
+}
+
+.leads-metric-label {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.1rem;
+}
+
+.leads-metric-value {
+  font-size: 1.3rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.leads-metric-value-warning {
+  color: #facc15;
+}
+
+.leads-metric-sub {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 0.15rem;
+}
+
+.leads-sidebar-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.leads-sidebar-fields .settings-field-label {
+  font-size: 0.8rem;
+}
+
+.leads-view-date-presets-column {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.4rem;
+  margin-top: 0.4rem;
+}
+
+.leads-sidebar-hint {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 0.4rem;
+}
+
+.leads-sidebar-footer {
+  margin-top: 0.25rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.leads-sidebar-count strong {
+  color: var(--text);
+}
+
+.leads-main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.leads-grid-modern {
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+}
+
+.lead-card-modern {
+  position: relative;
+  overflow: hidden;
+  background: radial-gradient(circle at top left, rgba(16, 185, 129, 0.16), transparent 55%),
+    var(--surface);
+  border-radius: 18px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.45);
+}
+
+.lead-card-modern::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.4), rgba(16, 185, 129, 0.2));
+  opacity: 0;
+  transition: opacity 0.2s ease-out;
+  pointer-events: none;
+}
+
+.lead-card-modern:hover::before {
+  opacity: 0.35;
+}
+
+.lead-card-modern .lead-card-header,
+.lead-card-modern .lead-card-fields,
+.lead-card-modern .lead-card-actions {
+  position: relative;
+}
+
+.lead-card-fields-compact div {
+  flex: 1 1 45%;
+}
+
+.lead-card-actions-split {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+
 /* ——— Ayarlar (yeniden tasarım) ——— */
 .settings-view { margin-bottom: 2rem; max-width: 960px; margin-left: auto; margin-right: auto; }
 .settings-loading { color: var(--muted); padding: 2rem 0; }
