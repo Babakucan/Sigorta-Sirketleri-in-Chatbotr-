@@ -12,6 +12,9 @@ uploads/
 data/*.db
 data/*.db-journal
 
+# WhatsApp web oturumu (whatsapp-web.js)
+.wwebjs_auth/
+
 # Build çıktıları
 admin-app/dist/
 

@@ -7,10 +7,9 @@ if (OPENAI_API_KEY) console.log("OPENAI_API_KEY: yüklendi (ruhsat AI aktif)");
 console.log("[Boot] index.js " + new Date().toISOString());
 
 const express = require("express");
-const { Telegraf, Markup } = require("telegraf");
 const { getLeads, getLeadById, insertLead, updateLead, getConversations, addConversation, getPackages, updatePackage, insertPackage, getSetting, setSetting, getOrAssignVariant, hasAnyLeadForChat, hasChattedBefore, getLastFirstNameForChat, getChatStateFromDb, setChatStateInDb, markChatStateWarningSent, getAllActiveChatStates } = require("./db");
 const { extractRuhsatFromImage, syncLeadFieldsFromRuhsat } = require("./lib/ruhsat");
-const { sendAndTrackTelegram, runTelegramMessageCleanup } = require("./lib/telegram");
+const whatsapp = require("./lib/whatsapp");
 
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) {
@@ -22,7 +21,6 @@ if (!fs.existsSync(UPLOAD_DIR)) {
  const ADMIN_SECRET = process.env.ADMIN_SECRET || "dev-admin-secret";
  const ADMIN_USER = process.env.ADMIN_USER || "admin";
  const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
- const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
  const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
  const sessions = new Map();
@@ -44,10 +42,35 @@ if (!fs.existsSync(UPLOAD_DIR)) {
    return true;
  }
 
- if (!TELEGRAM_BOT_TOKEN) {
-   console.error("Missing TELEGRAM_BOT_TOKEN in environment.");
-   process.exit(1);
- }
+ /** WhatsApp: Seçenekler (numara ile yanıt) için bekleyen seçimler. */
+ const pendingChoices = new Map();
+
+async function sendToUser(chatId, text, choices = null) {
+  const baseText = String(text);
+
+  if (choices && choices.length > 0) {
+    // Numerik seçim fallback'i için tut.
+    pendingChoices.set(String(chatId), choices);
+
+    // Öncelik: gerçek WhatsApp interaktif butonları / listeleri.
+    if (typeof whatsapp.sendInteractiveMessage === "function") {
+      try {
+        await whatsapp.sendInteractiveMessage(chatId, baseText, choices);
+        return;
+      } catch (e) {
+        console.error("[WhatsApp] sendInteractiveMessage hata:", e?.message || e);
+      }
+    }
+
+    // Fallback: sadece metin + numaralı liste.
+    let fullText = baseText + "\n\n" + choices.map((c, i) => `${i + 1} - ${c.label}`).join("\n");
+    await whatsapp.sendMessage(chatId, fullText);
+    return;
+  }
+
+  pendingChoices.delete(String(chatId));
+  await whatsapp.sendMessage(chatId, baseText);
+}
 
 /** State cache (same request için) - DB'den okunan state burada tutulur, böylece aynı handler içinde tekrar DB'ye gitmeyiz. */
 const chatStates = {};
@@ -94,8 +117,104 @@ function setCachedPhotoResult(chatId, fileUniqueId, leadId, ruhsatData) {
 }
 
  
+// En başta: her isteği logla (webhook / admin gelince mutlaka görürsün)
+ const REQUESTS_LOG = path.join(__dirname, "requests.log");
+ app.use((req, res, next) => {
+   const line = `[${new Date().toISOString()}] ${req.method} ${req.url}\n`;
+   process.stdout.write("[Req] " + req.method + " " + req.url + "\n");
+   try { fs.appendFileSync(REQUESTS_LOG, line); } catch (_) {}
+   next();
+ });
+
  app.use(express.urlencoded({ extended: true }));
  app.use(express.json());
+
+// ----- WhatsApp Cloud API webhook (Meta'nın isteyeceği URL) -----
+function handleWebhookVerify(req, res) {
+  const mode = (req.query["hub.mode"] || "").trim();
+  const token = (req.query["hub.verify_token"] || "").trim();
+  const challenge = req.query["hub.challenge"];
+  const verifyToken = (whatsapp.getVerifyToken() || "").trim();
+  console.log("[WhatsApp] Meta doğrulama: mode=%s, tokenEslesti=%s, challengeVar=%s", mode, token === verifyToken, !!challenge);
+  if (mode === "subscribe" && token === verifyToken && challenge != null && String(challenge).length > 0) {
+    console.log("[WhatsApp] Webhook doğrulandı, challenge döndürülüyor.");
+    res.setHeader("Content-Type", "text/plain");
+    return res.status(200).send(String(challenge));
+  }
+  console.log("[WhatsApp] Doğrulama reddedildi (403).");
+  res.status(403).send("Forbidden");
+}
+app.get("/webhook/whatsapp", handleWebhookVerify);
+app.get("/webhook/whatsapp/", handleWebhookVerify); // Trailing slash ile gelen istekler için
+
+app.post("/webhook/whatsapp", async (req, res) => {
+  res.status(200).send("OK");
+  const body = req.body;
+  const hasEntries = body?.object === "whatsapp_business_account" && Array.isArray(body.entry);
+  console.log("[WhatsApp] POST alındı, entry var mı:", hasEntries, body?.entry?.length || 0);
+  if (!hasEntries) return;
+  for (const entry of body.entry) {
+    const changes = entry.changes || [];
+    for (const change of changes) {
+      if (change.field !== "messages") continue;
+      const value = change.value;
+      const messages = value?.messages || [];
+      for (const msg of messages) {
+        const chatId = msg.from;
+        if (msg.type === "text" && msg.text?.body != null) {
+          const text = String(msg.text.body).trim();
+          setImmediate(async () => {
+            try {
+              const choices = pendingChoices.get(chatId);
+              if (choices && text) {
+                const i = parseInt(text, 10);
+                if (i >= 1 && i <= choices.length) {
+                  pendingChoices.delete(chatId);
+                  await handleCallbackAction(chatId, choices[i - 1].action);
+                  return;
+                }
+              }
+              await handleText(chatId, text);
+            } catch (e) {
+              console.error("[WhatsApp] handleText:", e?.message);
+            }
+          });
+        } else if (msg.type === "interactive" && msg.interactive) {
+          // Gerçek WhatsApp buton / list yanıtları.
+          setImmediate(async () => {
+            try {
+              const it = msg.interactive;
+              let actionId = null;
+              // Cloud API inbound: interactive.type === "button_reply" | "list_reply"
+              if (it.type === "button_reply" && it.button_reply?.id) {
+                actionId = it.button_reply.id;
+              } else if (it.type === "list_reply" && it.list_reply?.id) {
+                actionId = it.list_reply.id;
+              }
+              if (actionId) {
+                pendingChoices.delete(String(chatId));
+                await handleCallbackAction(chatId, actionId);
+                return;
+              }
+              console.warn("[WhatsApp] interactive mesaj id bulunamadı:", JSON.stringify(it));
+            } catch (e) {
+              console.error("[WhatsApp] interactive handler:", e?.message);
+            }
+          });
+        } else if (msg.type === "image" && msg.image?.id) {
+          setImmediate(async () => {
+            try {
+              const { filePath, fileUniqueId } = await whatsapp.downloadMedia(msg.image.id);
+              await handlePhoto(chatId, filePath, fileUniqueId);
+            } catch (e) {
+              console.error("[WhatsApp] handlePhoto:", e?.message);
+            }
+          });
+        }
+      }
+    }
+  }
+});
  
 function escapeHtml(str) {
   if (!str) return "";
@@ -382,16 +501,15 @@ app.post("/api/leads/:id/send-quote", apiAuth, async (req, res) => {
   const msg =
     `Harika haber! 🎉 Seçtiğiniz ${pkgName} için en uygun teklifimiz hazır: ${Math.round(amount).toLocaleString("tr-TR")} TL. ` +
     "Bu teklif 20 farklı şirketten taranarak en iyi fiyat olarak belirlenmiştir.";
-  const replyMarkup = {
-    inline_keyboard: [
-      [{ text: "📞 Evet, arasın", callback_data: "arama_evet_" + id }, { text: "Hayır", callback_data: "arama_hayir_" + id }],
-    ],
-  };
+  const aramaChoices = [
+    { label: "📞 Evet, arasın", action: "arama_evet_" + id },
+    { label: "Hayır", action: "arama_hayir_" + id },
+  ];
   try {
-    await sendAndTrackTelegram(req.app.locals.bot.telegram, lead.chatId, msg);
-    await sendAndTrackTelegram(req.app.locals.bot.telegram, lead.chatId, "Müşteri temsilcimiz sizi arasın mı? 📞", { reply_markup: replyMarkup });
+    await sendToUser(lead.chatId, msg);
+    await sendToUser(lead.chatId, "Müşteri temsilcimiz sizi arasın mı? 📞", aramaChoices);
   } catch (err) {
-    console.error("Send quote Telegram error:", err.message);
+    console.error("Send quote WhatsApp error:", err.message);
     return res.status(500).json({ error: "Müşteriye mesaj gönderilemedi: " + err.message });
   }
   res.json(getLeadById(id));
@@ -464,9 +582,7 @@ app.get("/admin", (req, res) => {
    });
  }
 
- // Telegram bot setup
- const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
- app.locals.bot = bot;
+ app.locals.sendToUser = sendToUser;
  
 function addMessage(chatId, role, text, opts = {}) {
   addConversation({
@@ -565,20 +681,72 @@ function getMenuTextReturning(chatId) {
   return greeting + " Size nasıl yardımcı olabilirim?\n\nLütfen aşağıdan bir işlem seçin.";
 }
 
- function menuInlineKeyboard() {
-   return Markup.inlineKeyboard([
-     [Markup.button.callback("📋 Yeni Teklif", "menu_1"), Markup.button.callback("🚗 Hasar", "menu_2")],
-     [Markup.button.callback("📄 Poliçe", "menu_3"), Markup.button.callback("📑 Belge", "menu_4")],
-     [Markup.button.callback("💬 Canlı Destek", "menu_5")],
-   ]);
- }
+const MENU_CHOICES = [
+  { label: "📋 Yeni Teklif", action: "menu_1" },
+  { label: "🚗 Hasar", action: "menu_2" },
+  { label: "📄 Poliçe", action: "menu_3" },
+  { label: "📑 Belge", action: "menu_4" },
+  { label: "💬 Canlı Destek", action: "menu_5" },
+];
 
- function menuTransitionConfirmKeyboard(menuData) {
-   return Markup.inlineKeyboard([
-     [Markup.button.callback("Evet, iptal et", "cancel_and_menu_" + menuData)],
-     [Markup.button.callback("Hayır, devam et", "cancel_no")],
-   ]);
- }
+function menuTransitionConfirmChoices(menuData) {
+  return [
+    { label: "Evet, iptal et", action: "cancel_and_menu_" + menuData },
+    { label: "Hayır, devam et", action: "cancel_no" },
+  ];
+}
+
+const MAIN_MENU_CHOICE = [{ label: "🏠 Ana Menü", action: "main_menu" }];
+
+function packageChoices(includeDetay = true, leadId = null) {
+  const packages = getPackages();
+  const choices = packages.map((p) => ({ label: p.name, action: p.key }));
+  if (leadId) choices.push({ label: "📞 Beni Ara", action: "pkg_ara" });
+  if (includeDetay) choices.push({ label: "Detay", action: "pkg_detay" });
+  return choices;
+}
+
+function tescilBelgeMenuChoices(lead) {
+  return [
+    { label: "✍️ Tescil No'yu elle yazayım", action: "manual_tescil_" + lead.id },
+    { label: "📸 Tekrar fotoğraf çek", action: "retry_upload_" + lead.id },
+    { label: "🏠 Ana Menü", action: "main_menu" },
+  ];
+}
+function belgeMenuChoices(lead) {
+  return [
+    { label: "✍️ Belge No'yu elle yazayım", action: "manual_belge_" + lead.id },
+    { label: "📸 Tekrar fotoğraf çek", action: "retry_upload_" + lead.id },
+    { label: "🏠 Ana Menü", action: "main_menu" },
+  ];
+}
+function plateMenuChoices(lead) {
+  return [
+    { label: "✍️ Plakayı elle yazayım", action: "manual_plate_" + lead.id },
+    { label: "🏠 Ana Menü", action: "main_menu" },
+  ];
+}
+function confirmPlateChoices(lead) {
+  return [
+    { label: "✓ Evet, doğru", action: "confirm_plate_evet_" + lead.id },
+    { label: "✏️ Hayır, düzelt", action: "confirm_plate_hayir_" + lead.id },
+  ];
+}
+function tcMenuChoices(lead) {
+  return [
+    { label: "✍️ TC'yi tekrar yazayım", action: "manual_tc_" + lead.id },
+    { label: "🏠 Ana Menü", action: "main_menu" },
+  ];
+}
+const TEKLIF_YONTEM_CHOICES = [
+  { label: "✍️ Bilgileri yazarak", action: "teklif_yontem_yaz" },
+  { label: "📸 Ruhsat fotoğrafı göndererek", action: "teklif_yontem_ruhsat" },
+  { label: "🏠 Ana Menü", action: "main_menu" },
+];
+const MENU_OR_CANCEL_CHOICES = [
+  { label: "🏠 Ana Menü", action: "main_menu" },
+  { label: "Hayır, devam et", action: "cancel_no" },
+];
 
  function isInFlow(state) {
    return state && state.mode && IN_FLOW_MODES.includes(state.mode);
@@ -595,26 +763,17 @@ function getMenuTextReturning(chatId) {
    setChatState(chatId, null);
  }
 
- bot.start((ctx) => {
-   const chatId = ctx.chat.id;
+ async function handleStart(chatId) {
    addMessage(chatId, "user", "/start");
    const isReturning = hasAnyLeadForChat(chatId) || hasChattedBefore(chatId);
    const menuText = isReturning ? getMenuTextReturning(chatId) : MENU_TEXT_WELCOME;
    addMessage(chatId, "bot", menuText);
-   return sendAndTrackTelegram(ctx.telegram, ctx.chat.id, menuText, menuInlineKeyboard());
- });
+   return sendToUser(chatId, menuText, MENU_CHOICES);
+ }
 
- bot.on("callback_query", async (ctx) => {
-   const data = ctx.callbackQuery?.data;
-   const chatId = ctx.callbackQuery?.message?.chat?.id;
+ async function handleCallbackAction(chatId, data) {
+   try {
    if (data?.startsWith("arama_")) console.log("[callback] arama:", data, "chatId:", chatId);
-   if (!data || !chatId) return ctx.answerCbQuery();
-
-   try {
-   try { await ctx.answerCbQuery(); } catch (e) { if (!String(e?.message || "").includes("too old")) console.warn("answerCbQuery:", e?.message); }
-   try {
-     await ctx.editMessageReplyMarkup({ inline_keyboard: [] });
-   } catch (e) { if (!String(e?.message || "").includes("too old") && !String(e?.message || "").includes("message is not modified")) console.warn("editMessageReplyMarkup:", e?.message); }
 
   if (data.startsWith("arama_evet_")) {
     const leadId = parseInt(data.replace("arama_evet_", ""), 10);
@@ -625,12 +784,12 @@ function getMenuTextReturning(chatId) {
     if (lead && chatMatch) {
        const now = new Date();
        const mesaiIci = isWithinMesai(now);
-       const rows = [
-         [Markup.button.callback("⏱️ Hemen", "arama_zaman_hemen_" + leadId)],
-         [Markup.button.callback("📅 Özel tarih", "arama_zaman_ozel_tarih_" + leadId)],
+       const aramaZamanChoices = [
+         { label: "⏱️ Hemen", action: "arama_zaman_hemen_" + leadId },
+         { label: "📅 Özel tarih", action: "arama_zaman_ozel_tarih_" + leadId },
        ];
        const mesaj = mesaiIci ? "Temsilcimiz sizi ne zaman arasın? 📞" : "Üzgünüz, şu anda mesai saatleri dışındayız. 😅 Temsilcimiz sizi ne zaman arasın?";
-       await sendAndTrackTelegram(ctx.telegram, chatId, mesaj, Markup.inlineKeyboard(rows));
+       await sendToUser(chatId, mesaj, aramaZamanChoices);
      }
      return;
    }
@@ -647,31 +806,32 @@ function getMenuTextReturning(chatId) {
        const now = new Date();
        const gunler = getOzelTarihGunler(now);
       if (gunler.length === 0) {
-        await sendAndTrackTelegram(ctx.telegram, chatId, "Şu an için uygun mesai günü bulunamadı. 😅 Lütfen daha sonra tekrar deneyin.", Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+        await sendToUser(chatId, "Şu an için uygun mesai günü bulunamadı. 😅 Lütfen daha sonra tekrar deneyin.", MAIN_MENU_CHOICE);
         return;
       }
-       const rows = gunler.map((g) => [Markup.button.callback(g.label, "arama_ozel_gun_" + g.offset + "_" + lead.id)]);
+       const gunChoices = gunler.map((g) => ({ label: g.label, action: "arama_ozel_gun_" + g.offset + "_" + lead.id }));
        const { start, end } = getMesaiSettings();
        const istekTpl = getSetting("mesaj_ozel_tarih_istek") || "Aranma zamanı seçin (mesai: {start}-{end})";
        const istekMsg = istekTpl.replace(/\{start\}/g, start).replace(/\{end\}/g, end);
-       await sendAndTrackTelegram(ctx.telegram, chatId, istekMsg, Markup.inlineKeyboard(rows));
+       await sendToUser(chatId, istekMsg, gunChoices);
        return;
      }
-     if (lead && chatMatch && choice === "hemen") {
-       const now = new Date();
-       const mesaiIci = isWithinMesai(now);
+    if (lead && chatMatch && choice === "hemen") {
+      const now = new Date();
+      const mesaiIci = isWithinMesai(now);
       if (mesaiIci) {
         const msg = getSetting("mesaj_hemen_mesai_ici") || "Müşteri temsilcilerimiz en kısa sürede sizi arayacak. 📞 Teşekkürler! 😊";
-        await sendAndTrackTelegram(ctx.telegram, chatId, msg, menuInlineKeyboard());
+        // İşlem bitti; yalnızca bilgilendirme mesajı gönder.
+        await sendToUser(chatId, msg);
         updateLead(lead.id, { status: "arama_bekliyor", aramaTercihi: "Hemen" });
-         console.log("[arama_zaman] OK - lead", lead.id, "status=arama_bekliyor", "tercih=Hemen");
-       } else {
-         const template = getSetting("mesaj_hemen_mesai_dis") || "Üzgünüz, şu anda mesai saatleri içinde değiliz. {mesaiAraligi} aralığında Özel tarih seçerek aranma zamanı oluşturabilirsiniz.";
-         const msg = template.replace(/\{mesaiAraligi\}/g, getMesaiAraligi());
-         const rows = [[Markup.button.callback("📅 Özel tarih", "arama_zaman_ozel_tarih_" + lead.id)]];
-         await sendAndTrackTelegram(ctx.telegram, chatId, msg, Markup.inlineKeyboard(rows));
-       }
-     }
+        console.log("[arama_zaman] OK - lead", lead.id, "status=arama_bekliyor", "tercih=Hemen");
+      } else {
+        const template = getSetting("mesaj_hemen_mesai_dis") || "Üzgünüz, şu anda mesai saatleri içinde değiliz. {mesaiAraligi} aralığında Özel tarih seçerek aranma zamanı oluşturabilirsiniz.";
+        const msg = template.replace(/\{mesaiAraligi\}/g, getMesaiAraligi());
+        const ozelTarihChoice = [{ label: "📅 Özel tarih", action: "arama_zaman_ozel_tarih_" + lead.id }];
+        await sendToUser(chatId, msg, ozelTarihChoice);
+      }
+    }
      return;
    }
    if (data.startsWith("arama_ozel_gun_")) {
@@ -684,22 +844,17 @@ function getMenuTextReturning(chatId) {
        const now = new Date();
       const saatler = getOzelTarihSaatler(dayOffset, now);
       if (saatler.length === 0) {
-        const geriKb = Markup.inlineKeyboard([
-          [Markup.button.callback("◀️ Geri", "arama_zaman_ozel_tarih_" + lead.id)],
-          [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-        ]);
-        await sendAndTrackTelegram(ctx.telegram, chatId, "Bu gün için uygun saat kalmadı. 😅 Lütfen başka bir gün seçin.", geriKb);
+        const geriChoices = [
+          { label: "◀️ Geri", action: "arama_zaman_ozel_tarih_" + lead.id },
+          { label: "🏠 Ana Menü", action: "main_menu" },
+        ];
+        await sendToUser(chatId, "Bu gün için uygun saat kalmadı. 😅 Lütfen başka bir gün seçin.", geriChoices);
         return;
       }
-       const perRow = 4;
-       const rows = [];
-       for (let i = 0; i < saatler.length; i += perRow) {
-         const chunk = saatler.slice(i, i + perRow);
-         rows.push(chunk.map((s) => Markup.button.callback(s.label, "arama_ozel_saat_" + dayOffset + "_" + s.hhmm + "_" + lead.id)));
-       }
+       const saatChoices = saatler.map((s) => ({ label: s.label, action: "arama_ozel_saat_" + dayOffset + "_" + s.hhmm + "_" + lead.id }));
        const gunler = getOzelTarihGunler(now);
        const gunLabel = gunler.find((g) => g.offset === dayOffset)?.label || `${dayOffset} gün sonra`;
-       await sendAndTrackTelegram(ctx.telegram, chatId, `${gunLabel} için saat seçin: ⏰`, Markup.inlineKeyboard(rows));
+       await sendToUser(chatId, `${gunLabel} için saat seçin: ⏰`, saatChoices);
      }
      return;
    }
@@ -725,25 +880,27 @@ function getMenuTextReturning(chatId) {
        const aramaTercihi = `${gunLabel} ${saatLabel}`;
       updateLead(lead.id, { status: "arama_bekliyor", aramaTercihi });
       const onayTpl = getSetting("mesaj_ozel_tarih_onay") || "Tercihiniz kaydedildi. {tarih} tarihinde sizi arayacağız.";
-      await sendAndTrackTelegram(ctx.telegram, chatId, onayTpl.replace(/\{tarih\}/g, aramaTercihi), menuInlineKeyboard());
-       console.log("[arama_ozel_saat] OK - lead", lead.id, "aramaTercihi=", aramaTercihi);
+      // İşlem bitti; yalnızca bilgilendirme mesajı gönder.
+      await sendToUser(chatId, onayTpl.replace(/\{tarih\}/g, aramaTercihi));
+      console.log("[arama_ozel_saat] OK - lead", lead.id, "aramaTercihi=", aramaTercihi);
      }
      return;
    }
-   if (data.startsWith("arama_hayir_")) {
-     const msg = "Tamam, anladım. 😊 İhtiyacınız olursa her zaman bize ulaşabilirsiniz. İyi günler dilerim! 🙏";
-     await sendAndTrackTelegram(ctx.telegram, chatId, msg, menuInlineKeyboard());
-     return;
-   }
+  if (data.startsWith("arama_hayir_")) {
+    const msg = "Tamam, anladım. 😊 İhtiyacınız olursa her zaman bize ulaşabilirsiniz. İyi günler dilerim! 🙏";
+    // İşlem bitti; ekstra menü göstermeden sadece mesaj gönder.
+    await sendToUser(chatId, msg);
+    return;
+  }
 
    if (data === "teklif_yontem_yaz") {
      if (isInFlow(getChatState(chatId))) {
        const reply = "Şu anda devam eden bir işleminiz var. İptal edip yeni işleme geçmek ister misiniz?";
        addMessage(chatId, "bot", reply);
-       await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard([
-         [Markup.button.callback("Evet, iptal et", "teklif_yontem_yaz_confirm")],
-         [Markup.button.callback("Hayır, devam et", "cancel_no")],
-       ]));
+      await sendToUser(chatId, reply, [
+        { label: "Evet, iptal et", action: "teklif_yontem_yaz_confirm" },
+        { label: "Hayır, devam et", action: "cancel_no" },
+      ]);
        return;
      }
      addMessage(chatId, "user", "[Yöntem: Bilgileri yazarak]");
@@ -752,24 +909,24 @@ function getMenuTextReturning(chatId) {
     const step = getStepIndicator("ask_name");
     const reply = step + "Harika! 😊 Önce adınız ve soyadınızı alabilir miyim lütfen? (Örn: Ahmet Yılmaz)";
     addMessage(chatId, "bot", reply);
-    await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+    await sendToUser(chatId, reply, MAIN_MENU_CHOICE);
     return;
   }
   if (data === "teklif_yontem_yaz_confirm") {
     cancelLeadAndClearState(chatId);
     const reply = "İşleminiz iptal edilmiştir. 😊 Size nasıl yardımcı olabilirim?";
     addMessage(chatId, "bot", reply);
-    await sendAndTrackTelegram(ctx.telegram, chatId, reply, menuInlineKeyboard());
+    await sendToUser(chatId, reply, MENU_CHOICES);
     return;
    }
    if (data === "teklif_yontem_ruhsat") {
      if (isInFlow(getChatState(chatId))) {
        const reply = "Şu anda devam eden bir işleminiz var. İptal edip yeni işleme geçmek ister misiniz?";
        addMessage(chatId, "bot", reply);
-       await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard([
-         [Markup.button.callback("Evet, iptal et", "teklif_yontem_ruhsat_confirm")],
-         [Markup.button.callback("Hayır, devam et", "cancel_no")],
-       ]));
+      await sendToUser(chatId, reply, [
+        { label: "Evet, iptal et", action: "teklif_yontem_ruhsat_confirm" },
+        { label: "Hayır, devam et", action: "cancel_no" },
+      ]);
        return;
      }
      addMessage(chatId, "user", "[Yöntem: Ruhsat fotoğrafı]");
@@ -778,14 +935,14 @@ function getMenuTextReturning(chatId) {
     const step = getStepIndicator("ask_plate");
     const reply = step + "📸 Lütfen ruhsat fotoğrafınızı gönderin. Plaka, TC ve diğer bilgileri görselden otomatik okuyacağım.";
     addMessage(chatId, "bot", reply);
-    await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+    await sendToUser(chatId, reply, MAIN_MENU_CHOICE);
     return;
   }
   if (data === "teklif_yontem_ruhsat_confirm") {
     cancelLeadAndClearState(chatId);
     const reply = "İşleminiz iptal edilmiştir. 😊 Size nasıl yardımcı olabilirim?";
     addMessage(chatId, "bot", reply);
-    await sendAndTrackTelegram(ctx.telegram, chatId, reply, menuInlineKeyboard());
+    await sendToUser(chatId, reply, MENU_CHOICES);
     return;
    }
 
@@ -793,16 +950,12 @@ function getMenuTextReturning(chatId) {
     cancelLeadAndClearState(chatId);
     const menuText = getMenuTextReturning(chatId);
     addMessage(chatId, "bot", menuText);
-    await sendAndTrackTelegram(ctx.telegram, chatId, menuText, menuInlineKeyboard());
+    await sendToUser(chatId, menuText, MENU_CHOICES);
      return;
    }
 
    if (data === "cancel_no") {
-     try {
-       await ctx.telegram.editMessageText(chatId, ctx.callbackQuery.message.message_id, void 0, "Tamam, mevcut işleminize devam edebilirsiniz.");
-     } catch (e) {
-       if (!String(e?.message || "").includes("message is not modified")) console.warn("cancel_no edit:", e?.message);
-     }
+     await sendToUser(chatId, "Tamam, mevcut işleminize devam edebilirsiniz.");
      return;
    }
 
@@ -810,7 +963,7 @@ function getMenuTextReturning(chatId) {
     cancelLeadAndClearState(chatId);
     const reply = "İşleminiz iptal edildi. 😊 Size nasıl yardımcı olabilirim?";
     addMessage(chatId, "bot", reply);
-    await sendAndTrackTelegram(ctx.telegram, chatId, reply, menuInlineKeyboard());
+    await sendToUser(chatId, reply, MENU_CHOICES);
     return;
   }
 
@@ -833,19 +986,17 @@ function getMenuTextReturning(chatId) {
           setChatState(chatId, { mode: "ask_tescil_sira", leadId: lead.id });
           const step = getStepIndicator("ask_tescil_sira");
           const reply = step + `Teşekkürler! 😊 Plakanız ${lead.plate} olarak kaydedildi.\n\nRuhsatınızın (Y.2) numaralı alanındaki tescil numarasını sadece rakamlarla yazar mısınız? (16-20 hane) 📄`;
-          const rows = [[Markup.button.callback("✍️ Tescil No'yu elle yazayım", "manual_tescil_" + lead.id)], [Markup.button.callback("📸 Tekrar fotoğraf çek", "retry_upload_" + lead.id)], [Markup.button.callback("🏠 Ana Menü", "main_menu")]];
-          await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+          await sendToUser(chatId, reply, tescilBelgeMenuChoices(lead));
         } else if (next === "belge") {
           setChatState(chatId, { mode: "ask_belge_seri", leadId: lead.id });
           const step = getStepIndicator("ask_belge_seri");
           const reply = step + `Teşekkürler! 😊 Plakanız ${lead.plate} olarak kaydedildi.\n\nRuhsatın sağ alt köşesindeki belge numarasını (2 harf + 6 rakam, örn: HF 964933) yazar mısınız? 📄`;
-          const rows = [[Markup.button.callback("✍️ Belge No'yu elle yazayım", "manual_belge_" + lead.id)], [Markup.button.callback("📸 Tekrar fotoğraf çek", "retry_upload_" + lead.id)], [Markup.button.callback("🏠 Ana Menü", "main_menu")]];
-          await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+          await sendToUser(chatId, reply, belgeMenuChoices(lead));
         } else if (next === "kullanim") {
           setChatState(chatId, { mode: "ask_kullanim_tarzi", leadId: lead.id });
           const step = getStepIndicator("ask_kullanim_tarzi");
           const reply = step + `Görselden okuyamadım. 😅 Aracınızın kullanım tarzını yazar mısınız? (Örn: Hususi otomobil, kamyonet)`;
-          await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+          await sendToUser(chatId, reply, MAIN_MENU_CHOICE);
         } else {
           updated.status = "awaiting_marka_km";
           updateLead(lead.id, { status: "awaiting_marka_km" });
@@ -853,13 +1004,13 @@ function getMenuTextReturning(chatId) {
           const step = getStepIndicator("ask_marka_km");
           const hasMarka = hasMarkaFromRuhsat(updated);
           const reply = step + (hasMarka ? `Teşekkürler! 😊 Plakanız ${lead.plate} olarak kaydedildi.\n\nAracınızın yaklaşık km bilgisini yazar mısınız? (Örn: 45000 km) 🚗` : `Teşekkürler! 😊 Plakanız ${lead.plate} olarak kaydedildi.\n\nAracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km) 🚗`);
-          await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+          await sendToUser(chatId, reply, MAIN_MENU_CHOICE);
         }
       } else {
         setChatState(chatId, { mode: "ask_tc", leadId: lead.id });
         const step = getStepIndicator("ask_tc");
         const reply = step + `Teşekkürler! 😊 Plakanız ${lead.plate} olarak kaydedildi.\n\nSize özel hasarsızlık indirimlerini sorgulayabilmem için T.C. Kimlik Numaranızı alabilir miyim lütfen? (11 rakam) 🆔`;
-        await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+        await sendToUser(chatId, reply, MAIN_MENU_CHOICE);
       }
     }
     return;
@@ -873,8 +1024,7 @@ function getMenuTextReturning(chatId) {
       setChatState(chatId, { mode: "ask_plate", leadId: lead.id });
       const step = getStepIndicator("ask_plate");
       const reply = step + "Anladım. 😊 Lütfen plakayı doğru şekilde yazar mısınız? (Örn: 34ABC123 veya 06ANK06)";
-      const rows = [[Markup.button.callback("✍️ Plakayı elle yazayım", "manual_plate_" + lead.id)], [Markup.button.callback("🏠 Ana Menü", "main_menu")]];
-      await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+      await sendToUser(chatId, reply, plateMenuChoices(lead));
     }
     return;
   }
@@ -886,7 +1036,7 @@ function getMenuTextReturning(chatId) {
        setChatState(chatId, { mode: "ask_plate", leadId: lead.id });
        const reply = "📸 Fotoğrafınız alındı, teşekkürler! Plaka kısmını net okuyamadım. Lütfen plakanızı yazar mısınız? (Örn: 34ABC123)";
        addMessage(chatId, "bot", reply);
-       await sendAndTrackTelegram(ctx.telegram, chatId, reply);
+       await sendToUser(chatId, reply);
      }
      return;
    }
@@ -897,7 +1047,7 @@ function getMenuTextReturning(chatId) {
        setChatState(chatId, { mode: "ask_tc", leadId: lead.id });
        const reply = "🆔 TC Kimlik No 11 haneli olmalı. Lütfen sadece rakamları yazar mısınız?";
        addMessage(chatId, "bot", reply);
-       await sendAndTrackTelegram(ctx.telegram, chatId, reply);
+       await sendToUser(chatId, reply);
      }
      return;
    }
@@ -908,7 +1058,7 @@ function getMenuTextReturning(chatId) {
        setChatState(chatId, { mode: "ask_tescil_sira", leadId: lead.id });
        const reply = "📄 Ruhsatınızın (Y.2) numaralı alanındaki tescil numarasını net göremedim. Sadece rakamlarla yazar mısınız? (16-20 hane)";
        addMessage(chatId, "bot", reply);
-       await sendAndTrackTelegram(ctx.telegram, chatId, reply);
+       await sendToUser(chatId, reply);
      }
      return;
    }
@@ -919,7 +1069,7 @@ function getMenuTextReturning(chatId) {
        setChatState(chatId, { mode: "ask_belge_seri", leadId: lead.id });
        const reply = "Ruhsatın sağ alt köşesindeki belge numarasını (2 harf + 6 rakam, örn: HF 964933) tam okuyamadım. Yazar mısınız? 📄";
        addMessage(chatId, "bot", reply);
-       await sendAndTrackTelegram(ctx.telegram, chatId, reply);
+       await sendToUser(chatId, reply);
      }
      return;
    }
@@ -930,7 +1080,7 @@ function getMenuTextReturning(chatId) {
        setChatState(chatId, { mode: "ask_plate", leadId: lead.id });
        const reply = "📸 Lütfen ruhsat fotoğrafınızı tekrar gönderin; bilgileri görüntüden okumayı deneyeceğim. 😊";
        addMessage(chatId, "bot", reply);
-       await sendAndTrackTelegram(ctx.telegram, chatId, reply);
+       await sendToUser(chatId, reply);
      }
      return;
    }
@@ -940,7 +1090,7 @@ function getMenuTextReturning(chatId) {
      if (isInFlow(state)) {
        const reply = "Şu anda devam eden bir işleminiz var. İptal edip yeni işleme geçmek ister misiniz?";
        addMessage(chatId, "bot", reply);
-       await sendAndTrackTelegram(ctx.telegram, chatId, reply, menuTransitionConfirmKeyboard("1"));
+       await sendToUser(chatId, reply, menuTransitionConfirmChoices("1"));
        return;
      }
      addMessage(chatId, "user", "[Menü: Yeni Teklif]");
@@ -948,13 +1098,9 @@ function getMenuTextReturning(chatId) {
       "Merhaba! 😊 Ben araç sigortası konusunda yanınızdayım. Size en uygun teklifi sunabilmem için birkaç bilgiye ihtiyacım var; " +
       "ardından paket seçiminize göre fiyat sunacağız.\n\n" +
       "Nasıl devam etmek istersiniz?";
-     const yontemKlavye = Markup.inlineKeyboard([
-       [Markup.button.callback("✍️ Bilgileri yazarak", "teklif_yontem_yaz")],
-       [Markup.button.callback("📸 Ruhsat fotoğrafı göndererek", "teklif_yontem_ruhsat")],
-       [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-     ]);
+     const yontemKlavye = TEKLIF_YONTEM_CHOICES;
      addMessage(chatId, "bot", teklifTanitim);
-     await sendAndTrackTelegram(ctx.telegram, chatId, teklifTanitim, yontemKlavye);
+     await sendToUser(chatId, teklifTanitim, yontemKlavye);
      return;
    }
    if (data === "menu_2") {
@@ -962,7 +1108,7 @@ function getMenuTextReturning(chatId) {
      if (isInFlow(state)) {
        const reply = "Şu anda devam eden bir işleminiz var. İptal edip yeni işleme geçmek ister misiniz?";
        addMessage(chatId, "bot", reply);
-       await sendAndTrackTelegram(ctx.telegram, chatId, reply, menuTransitionConfirmKeyboard("2"));
+       await sendToUser(chatId, reply, menuTransitionConfirmChoices("2"));
        return;
      }
      addMessage(chatId, "user", "[Menü: Hasar]");
@@ -974,7 +1120,7 @@ function getMenuTextReturning(chatId) {
        "📞 Acil çekici için: 0850 XXX XX XX\n\n" +
        "İsterseniz aşağıdan Canlı Destek ile temsilciye bağlanabilirsiniz. 😊";
      addMessage(chatId, "bot", reply);
-     await sendAndTrackTelegram(ctx.telegram, chatId, reply, menuInlineKeyboard());
+     await sendToUser(chatId, reply, MENU_CHOICES);
      return;
    }
    if (data === "menu_3") {
@@ -982,7 +1128,7 @@ function getMenuTextReturning(chatId) {
      if (isInFlow(state)) {
        const reply = "Şu anda devam eden bir işleminiz var. İptal edip yeni işleme geçmek ister misiniz?";
        addMessage(chatId, "bot", reply);
-       await sendAndTrackTelegram(ctx.telegram, chatId, reply, menuTransitionConfirmKeyboard("3"));
+       await sendToUser(chatId, reply, menuTransitionConfirmChoices("3"));
        return;
      }
      addMessage(chatId, "user", "[Menü: Poliçe]");
@@ -990,7 +1136,7 @@ function getMenuTextReturning(chatId) {
        "📄 Poliçe bilgi ve kapsam sorgulama özelliği yakında devreye alınacak.\n\n" +
        "Şimdilik teklif almak veya canlı destek için aşağıdaki menüyü kullanabilirsiniz. 😊";
      addMessage(chatId, "bot", reply);
-     await sendAndTrackTelegram(ctx.telegram, chatId, reply, menuInlineKeyboard());
+     await sendToUser(chatId, reply, MENU_CHOICES);
      return;
    }
    if (data === "menu_4") {
@@ -998,7 +1144,7 @@ function getMenuTextReturning(chatId) {
      if (isInFlow(state)) {
        const reply = "Şu anda devam eden bir işleminiz var. İptal edip yeni işleme geçmek ister misiniz?";
        addMessage(chatId, "bot", reply);
-       await sendAndTrackTelegram(ctx.telegram, chatId, reply, menuTransitionConfirmKeyboard("4"));
+       await sendToUser(chatId, reply, menuTransitionConfirmChoices("4"));
        return;
      }
      addMessage(chatId, "user", "[Menü: Belge]");
@@ -1006,7 +1152,7 @@ function getMenuTextReturning(chatId) {
        "📑 Belge talebi (poliçe PDF, kartuş, makbuz) özelliği yakında eklenecek.\n\n" +
        "Canlı destekten belge talebinde bulunmak için aşağıdaki menüden Canlı Destek'e tıklayabilirsiniz. 😊";
      addMessage(chatId, "bot", reply);
-     await sendAndTrackTelegram(ctx.telegram, chatId, reply, menuInlineKeyboard());
+     await sendToUser(chatId, reply, MENU_CHOICES);
      return;
    }
    if (data === "menu_5") {
@@ -1014,7 +1160,7 @@ function getMenuTextReturning(chatId) {
      if (isInFlow(state)) {
        const reply = "Şu anda devam eden bir işleminiz var. İptal edip yeni işleme geçmek ister misiniz?";
        addMessage(chatId, "bot", reply);
-       await sendAndTrackTelegram(ctx.telegram, chatId, reply, menuTransitionConfirmKeyboard("5"));
+       await sendToUser(chatId, reply, menuTransitionConfirmChoices("5"));
        return;
      }
     addMessage(chatId, "user", "[Menü: Canlı Destek]");
@@ -1022,7 +1168,7 @@ function getMenuTextReturning(chatId) {
       "Hemen sizi bir temsilcimize yönlendiriyoruz. 💬 Bekleme süresi yaklaşık 2 dakika. Lütfen ayrılmayın.\n\n" +
       "Temsilcimiz en kısa sürede dönüş yapacaktır. 😊";
     addMessage(chatId, "bot", reply);
-    await sendAndTrackTelegram(ctx.telegram, chatId, reply, menuInlineKeyboard());
+    await sendToUser(chatId, reply, MENU_CHOICES);
     return;
   }
 
@@ -1037,60 +1183,58 @@ function getMenuTextReturning(chatId) {
         pkgs.map((p) => `${p.name}: ${p.description}`).join("\n\n") +
         "\n\nHangi kapsamda koruma istersiniz? Aşağıdaki butonlardan seçin. 😊";
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, chatId, reply, packageInlineKeyboard(false, lead.id));
+      await sendToUser(chatId, reply, packageChoices(false, lead.id));
       return;
     }
-     if (data === "pkg_ara") {
-       lead.packageChoice = "Beni Ara";
-       lead.status = "completed";
-       updateLead(lead.id, { packageChoice: "Beni Ara", status: "completed" });
-       setChatState(chatId, null);
-       const reply =
-         "Talebiniz alındı. 📞 Temsilcimiz en kısa sürede sizi arayıp size özel fiyat ve indirim seçeneklerini sunacaktır. Teşekkürler! 😊";
-       addMessage(chatId, "bot", reply);
-       await sendAndTrackTelegram(ctx.telegram, chatId, reply, menuInlineKeyboard());
-       return;
-     }
+    if (data === "pkg_ara") {
+      lead.packageChoice = "Beni Ara";
+      lead.status = "completed";
+      updateLead(lead.id, { packageChoice: "Beni Ara", status: "completed" });
+      setChatState(chatId, null);
+      const reply =
+        "Talebiniz alındı. 📞 Temsilcimiz en kısa sürede sizi arayıp size özel fiyat ve indirim seçeneklerini sunacaktır. Teşekkürler! 😊";
+      addMessage(chatId, "bot", reply);
+      // İşlem bitti; menü yerine yalnızca bilgilendirme mesajı gönder.
+      await sendToUser(chatId, reply);
+      return;
+    }
      const pkgMap = Object.fromEntries(getPackages().map((p) => [p.key, p.name]));
      const pkg = pkgMap[data];
-     if (pkg) {
-       lead.packageChoice = pkg;
-       updateLead(lead.id, { packageChoice: pkg, status: "fiyat_bekleniyor" });
-       setChatState(chatId, null);
-       const reply =
-         "Tercihiniz kaydedildi. 😊 Teklifiniz hazırlanıyor; en kısa sürede size dönüş yapacağız.";
-       addMessage(chatId, "bot", reply);
-       await sendAndTrackTelegram(ctx.telegram, chatId, reply, menuInlineKeyboard());
-     }
+    if (pkg) {
+      lead.packageChoice = pkg;
+      updateLead(lead.id, { packageChoice: pkg, status: "fiyat_bekleniyor" });
+      setChatState(chatId, null);
+      const reply =
+        "Tercihiniz kaydedildi. 😊 Teklifiniz hazırlanıyor; en kısa sürede size dönüş yapacağız.";
+      addMessage(chatId, "bot", reply);
+      // İşlem bitti; menü yerine yalnızca bilgilendirme mesajı gönder.
+      await sendToUser(chatId, reply);
+    }
    }
-   } catch (err) {
-     console.error("callback_query error:", err.message || err);
-   }
- });
+  } catch (err) {
+    console.error("handleCallbackAction error:", err.message || err);
+  }
+ }
 
-bot.on("text", async (ctx) => {
-  const chatId = ctx.chat.id;
-  const userText = ctx.message.text || "";
+ async function handleText(chatId, userText) {
+  userText = (userText || "").trim();
   addMessage(chatId, "user", userText);
 
   const selamlar = ["merhaba", "selam", "hi", "hey", "günaydın", "iyi günler", "iyi akşamlar"];
-  if (selamlar.some((s) => userText.trim().toLowerCase() === s)) {
+  if (selamlar.some((s) => userText.toLowerCase() === s)) {
     const state = getChatState(chatId);
     if (isInFlow(state)) {
       const reply = "Devam eden teklifiniz var. Menüye dönmek istediğinize emin misiniz? Mevcut işlem iptal olacak.";
-      const keyboard = Markup.inlineKeyboard([
-        [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-        [Markup.button.callback("Hayır, devam et", "cancel_no")],
-      ]);
+      const keyboard = MENU_OR_CANCEL_CHOICES;
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, keyboard);
+      await sendToUser(chatId, reply, keyboard);
       return;
     }
     setChatState(chatId, null);
     const isReturning = hasAnyLeadForChat(chatId) || hasChattedBefore(chatId);
     const menuText = isReturning ? getMenuTextReturning(chatId) : MENU_TEXT_WELCOME;
     addMessage(chatId, "bot", menuText);
-    await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, menuText, menuInlineKeyboard());
+    await sendToUser(chatId, menuText, MENU_CHOICES);
     return;
   }
 
@@ -1105,7 +1249,7 @@ bot.on("text", async (ctx) => {
       const step = getStepIndicator("ask_name");
       const reply = step + "Lütfen adınızı ve soyadınızı yazar mısınız? ✍️ (Örn: Ahmet Yılmaz)";
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+      await sendToUser(chatId, reply, MAIN_MENU_CHOICE);
       return;
     } else {
       const parts = fullName.trim().split(/\s+/);
@@ -1118,7 +1262,7 @@ bot.on("text", async (ctx) => {
         step + `Teşekkürler ${firstName}! 😊 İşlemi başlatmak için aracınızın plakasını yazar mısınız? (Örn: 34ABC123)\n\n` +
         "İsterseniz ruhsat fotoğrafı da gönderebilirsiniz; bilgileri görselden otomatik okuruz. 📸";
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+      await sendToUser(chatId, reply, MAIN_MENU_CHOICE);
       return;
     }
   }
@@ -1142,26 +1286,16 @@ bot.on("text", async (ctx) => {
           setChatState(chatId, { mode: "ask_tescil_sira", leadId: lead.id });
           const step = getStepIndicator("ask_tescil_sira");
           const reply = step + `Teşekkürler! 😊 Plakanız ${lead.plate} olarak kaydedildi.\n\nRuhsatınızın (Y.2) numaralı alanındaki tescil numarasını sadece rakamlarla yazar mısınız? (16-20 hane) 📄`;
-          const rows = [
-            [Markup.button.callback("✍️ Tescil No'yu elle yazayım", "manual_tescil_" + lead.id)],
-            [Markup.button.callback("📸 Tekrar fotoğraf çek", "retry_upload_" + lead.id)],
-            [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-          ];
           addMessage(chatId, "bot", reply);
-          await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+          await sendToUser(chatId, reply, tescilBelgeMenuChoices(lead));
           return;
         }
         if (next === "belge") {
           setChatState(chatId, { mode: "ask_belge_seri", leadId: lead.id });
           const step = getStepIndicator("ask_belge_seri");
           const reply = step + `Teşekkürler! 😊 Plakanız ${lead.plate} olarak kaydedildi.\n\nRuhsatın sağ alt köşesindeki belge numarasını (2 harf + 6 rakam, örn: HF 964933) yazar mısınız? 📄`;
-          const rows = [
-            [Markup.button.callback("✍️ Belge No'yu elle yazayım", "manual_belge_" + lead.id)],
-            [Markup.button.callback("📸 Tekrar fotoğraf çek", "retry_upload_" + lead.id)],
-            [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-          ];
           addMessage(chatId, "bot", reply);
-          await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+          await sendToUser(chatId, reply, belgeMenuChoices(lead));
           return;
         }
         if (next === "kullanim") {
@@ -1169,7 +1303,7 @@ bot.on("text", async (ctx) => {
           const step = getStepIndicator("ask_kullanim_tarzi");
           const reply = step + `Görselden okuyamadım. 😅 Aracınızın kullanım tarzını lütfen yazar mısınız? (Örn: Hususi otomobil, kamyonet)`;
           addMessage(chatId, "bot", reply);
-          await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+          await sendToUser(chatId, reply, MAIN_MENU_CHOICE);
           return;
         }
         updated.status = "awaiting_marka_km";
@@ -1181,7 +1315,7 @@ bot.on("text", async (ctx) => {
           ? `Teşekkürler! 😊 Plakanız ${lead.plate} olarak kaydedildi.\n\nAracınızın yaklaşık km bilgisini lütfen yazar mısınız? (Örn: 45000 km) 🚗`
           : `Teşekkürler! 😊 Plakanız ${lead.plate} olarak kaydedildi.\n\nAracınızın markası ve yaklaşık km bilgisini lütfen yazar mısınız? (Örn: Toyota Corolla 45000 km) 🚗`);
         addMessage(chatId, "bot", reply);
-        await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+        await sendToUser(chatId, reply, MAIN_MENU_CHOICE);
         return;
       }
       setChatState(chatId, { mode: "ask_tc", leadId: lead.id });
@@ -1190,29 +1324,22 @@ bot.on("text", async (ctx) => {
         `Teşekkürler! 😊 Plakanız ${lead.plate} olarak kaydedildi.\n\n` +
         "Size özel hasarsızlık indirimlerini sorgulayabilmem için T.C. Kimlik Numaranızı alabilir miyim lütfen? (11 rakam) 🆔";
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+      await sendToUser(chatId, reply, MAIN_MENU_CHOICE);
       return;
     } else if (["h", "hayır"].includes(answer)) {
       lead.status = "plate_rejected";
       updateLead(lead.id, { status: "plate_rejected" });
       setChatState(chatId, { mode: "ask_plate", leadId: lead.id });
       const reply = "Anladım. 😊 Lütfen plakayı doğru şekilde yazar mısınız? (Örn: 34ABC123 veya 06ANK06)";
-      const rows = [
-        [Markup.button.callback("✍️ Plakayı elle yazayım", "manual_plate_" + lead.id)],
-        [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-      ];
-      addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+        addMessage(chatId, "bot", reply);
+      await sendToUser(chatId, reply, plateMenuChoices(lead));
       return;
     } else {
       const step = getStepIndicator("confirm_plate");
       const reply = step + `Görselden okunan plaka: ${state.plateGuess}\n\nPlaka doğru mu?`;
-      const kb = Markup.inlineKeyboard([
-        [Markup.button.callback("✓ Evet, doğru", "confirm_plate_evet_" + lead.id)],
-        [Markup.button.callback("✏️ Hayır, düzelt", "confirm_plate_hayir_" + lead.id)],
-      ]);
+      const kb = confirmPlateChoices(lead);
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, kb);
+      await sendToUser(chatId, reply, kb);
       return;
     }
   } else if (state && state.mode === "ask_plate") {
@@ -1222,12 +1349,8 @@ bot.on("text", async (ctx) => {
       setChatState(chatId, null);
     } else if (!plate) {
       const reply = "Plaka formatı hatalı görünüyor. 😅 Lütfen sadece rakam ve harfleri yazar mısınız? (Örn: 34ABC123 veya 06ANK06)";
-      const rows = [
-        [Markup.button.callback("✍️ Plakayı elle yazayım", "manual_plate_" + lead.id)],
-        [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-      ];
-      addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+        addMessage(chatId, "bot", reply);
+      await sendToUser(chatId, reply, plateMenuChoices(lead));
       return;
     } else {
       lead.plate = plate;
@@ -1242,32 +1365,22 @@ bot.on("text", async (ctx) => {
         if (next === "tescil") {
           setChatState(chatId, { mode: "ask_tescil_sira", leadId: lead.id });
           const msg = "Ruhsatınızın (Y.2) numaralı alanındaki tescil numarasını net göremedim. 📄 Sadece rakamlarla yazar mısınız? (16-20 hane)";
-          const rows = [
-            [Markup.button.callback("✍️ Tescil No'yu elle yazayım", "manual_tescil_" + lead.id)],
-            [Markup.button.callback("📸 Tekrar fotoğraf çek", "retry_upload_" + lead.id)],
-            [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-          ];
           addMessage(chatId, "bot", msg);
-          await sendAndTrackTelegram(ctx.telegram, chatId, msg, Markup.inlineKeyboard(rows));
+          await sendToUser(chatId, msg, tescilBelgeMenuChoices(lead));
           return;
         }
         if (next === "belge") {
           setChatState(chatId, { mode: "ask_belge_seri", leadId: lead.id });
           const msg = "Ruhsatın sağ alt köşesindeki belge numarasını (2 harf + 6 rakam, örn: HF 964933) tam okuyamadım. Yazar mısınız? 📄";
-          const rows = [
-            [Markup.button.callback("✍️ Belge No'yu elle yazayım", "manual_belge_" + lead.id)],
-            [Markup.button.callback("📸 Tekrar fotoğraf çek", "retry_upload_" + lead.id)],
-            [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-          ];
           addMessage(chatId, "bot", msg);
-          await sendAndTrackTelegram(ctx.telegram, chatId, msg, Markup.inlineKeyboard(rows));
+          await sendToUser(chatId, msg, belgeMenuChoices(lead));
           return;
         }
         if (next === "kullanim") {
           setChatState(chatId, { mode: "ask_kullanim_tarzi", leadId: lead.id });
           const msg = "Görselden okuyamadım. 😅 Aracınızın kullanım tarzını lütfen yazar mısınız? (Örn: Hususi otomobil, kamyonet)";
           addMessage(chatId, "bot", msg);
-          await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, msg);
+          await sendToUser(chatId, msg);
           return;
         }
         updateLead(lead.id, { status: "awaiting_marka_km" });
@@ -1275,14 +1388,14 @@ bot.on("text", async (ctx) => {
         const hasMarka = hasMarkaFromRuhsat(updated);
         const msg = hasMarka ? "Teşekkürler! 😊\n\nAracınızın yaklaşık km bilgisini lütfen yazar mısınız? (Örn: 45000 km) 🚗" : "Teşekkürler! 😊\n\nAracınızın markası ve yaklaşık km bilgisini lütfen yazar mısınız? (Örn: Toyota Corolla 45000 km) 🚗";
         addMessage(chatId, "bot", msg);
-        await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, msg);
+        await sendToUser(chatId, msg);
         return;
       }
       setChatState(chatId, { mode: "ask_tc", leadId: lead.id });
       const reply =
         "Teşekkürler! 🚗 Şimdi, size özel hasarsızlık indirimlerini sorgulayabilmemiz için T.C. Kimlik Numaranızı alabilir miyim? (11 rakam)";
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply);
+      await sendToUser(chatId, reply);
       return;
     }
   }
@@ -1294,12 +1407,8 @@ bot.on("text", async (ctx) => {
       setChatState(chatId, null);
     } else if (!tc) {
       const reply = "TC Kimlik No 11 haneli olmalı. 🆔 Bir rakam eksik olabilir mi? Lütfen kontrol edip tekrar yazar mısınız?";
-      const rows = [
-        [Markup.button.callback("✍️ TC'yi tekrar yazayım", "manual_tc_" + lead.id)],
-        [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-      ];
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+      await sendToUser(chatId, reply, tcMenuChoices(lead));
       return;
     } else {
       lead.tc = tc;
@@ -1315,32 +1424,22 @@ bot.on("text", async (ctx) => {
       if (next === "tescil") {
         setChatState(chatId, { mode: "ask_tescil_sira", leadId: lead.id });
         const reply = "Son olarak, ruhsatınızın (Y.2) numaralı alanındaki tescil numarasını net göremedim. 📄 Sadece rakamlarla yazar mısınız? (16-20 hane)";
-        const rows = [
-          [Markup.button.callback("✍️ Tescil No'yu elle yazayım", "manual_tescil_" + lead.id)],
-          [Markup.button.callback("📸 Tekrar fotoğraf çek", "retry_upload_" + lead.id)],
-          [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-        ];
         addMessage(chatId, "bot", reply);
-        await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+        await sendToUser(chatId, reply, tescilBelgeMenuChoices(lead));
         return;
       }
       if (next === "belge") {
         setChatState(chatId, { mode: "ask_belge_seri", leadId: lead.id });
         const reply = "Ruhsatın sağ alt köşesindeki belge numarasını (2 harf + 6 rakam, örn: HF 964933) tam okuyamadım. Yazar mısınız? 📄";
-        const rows = [
-          [Markup.button.callback("✍️ Belge No'yu elle yazayım", "manual_belge_" + lead.id)],
-          [Markup.button.callback("📸 Tekrar fotoğraf çek", "retry_upload_" + lead.id)],
-          [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-        ];
         addMessage(chatId, "bot", reply);
-        await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+        await sendToUser(chatId, reply, belgeMenuChoices(lead));
         return;
       }
       if (next === "kullanim") {
         setChatState(chatId, { mode: "ask_kullanim_tarzi", leadId: lead.id });
         const reply = "Görselden okuyamadım. 😅 Aracınızın kullanım tarzını lütfen yazar mısınız? (Örn: Hususi otomobil, kamyonet, ticari taksi)";
         addMessage(chatId, "bot", reply);
-        await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply);
+        await sendToUser(chatId, reply);
         return;
       }
       lead.status = "awaiting_marka_km";
@@ -1349,7 +1448,7 @@ bot.on("text", async (ctx) => {
       const hasMarka = hasMarkaFromRuhsat(updatedAfterTc);
       const reply = hasMarka ? "Teşekkürler! 😊\n\nAracınızın yaklaşık km bilgisini lütfen yazar mısınız? (Örn: 45000 km) 🚗" : "Teşekkürler! 😊\n\nAracınızın markası ve yaklaşık km bilgisini lütfen yazar mısınız? (Örn: Toyota Corolla 45000 km) 🚗";
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply);
+      await sendToUser(chatId, reply);
       return;
     }
   }
@@ -1361,12 +1460,8 @@ bot.on("text", async (ctx) => {
       setChatState(chatId, null);
     } else if (!tescilNo) {
       const reply = "Tescil numarası sadece rakamlardan oluşmalı (16-20 hane). Tekrar yazar mısınız? 😅";
-      const rows = [
-        [Markup.button.callback("✍️ Tescil No'yu tekrar yazayım", "manual_tescil_" + lead.id)],
-        [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-      ];
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+      await sendToUser(chatId, reply, [{ label: "✍️ Tescil No'yu tekrar yazayım", action: "manual_tescil_" + lead.id }, { label: "🏠 Ana Menü", action: "main_menu" }]);
       return;
     } else {
       const ruhsatData = { ...(lead.ruhsatData || {}), ruhsatSeriNo: tescilNo };
@@ -1377,20 +1472,15 @@ bot.on("text", async (ctx) => {
       if (next === "belge") {
         setChatState(chatId, { mode: "ask_belge_seri", leadId: lead.id });
         const reply = "Ruhsatın sağ alt köşesindeki belge numarasını (2 harf + 6 rakam, örn: HF 964933) tam okuyamadım. Yazar mısınız? 📄";
-        const rows = [
-          [Markup.button.callback("✍️ Belge No'yu elle yazayım", "manual_belge_" + lead.id)],
-          [Markup.button.callback("📸 Tekrar fotoğraf çek", "retry_upload_" + lead.id)],
-          [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-        ];
         addMessage(chatId, "bot", reply);
-        await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+        await sendToUser(chatId, reply, belgeMenuChoices(lead));
         return;
       }
       if (next === "kullanim") {
         setChatState(chatId, { mode: "ask_kullanim_tarzi", leadId: lead.id });
         const reply = "Görselden okunamadı: Aracınızın kullanım tarzı nedir? (Örn: Hususi otomobil, kamyonet)";
         addMessage(chatId, "bot", reply);
-        await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply);
+        await sendToUser(chatId, reply);
         return;
       }
       lead.status = "awaiting_marka_km";
@@ -1399,7 +1489,7 @@ bot.on("text", async (ctx) => {
       const hasMarka = hasMarkaFromRuhsat(updated);
       const reply = hasMarka ? "Aracınızın yaklaşık km bilgisini lütfen yazar mısınız? (Örn: 45000 km) 🚗" : "Aracınızın markası ve yaklaşık km bilgisini lütfen yazar mısınız? (Örn: Toyota Corolla 45000 km) 🚗";
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply);
+      await sendToUser(chatId, reply);
       return;
     }
   }
@@ -1411,12 +1501,8 @@ bot.on("text", async (ctx) => {
       setChatState(chatId, null);
     } else if (!belgeSeri) {
       const reply = "Ruhsatın sağ alt köşesindeki belge numarasını (2 harf + 6 rakam, örn: HF 964933) tam okuyamadım. Yazar mısınız? 📄";
-      const rows = [
-        [Markup.button.callback("✍️ Belge No'yu tekrar yazayım", "manual_belge_" + lead.id)],
-        [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-      ];
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+      await sendToUser(chatId, reply, [{ label: "✍️ Belge No'yu tekrar yazayım", action: "manual_belge_" + lead.id }, { label: "🏠 Ana Menü", action: "main_menu" }]);
       return;
     } else {
       const normalized = belgeSeri.replace(/\s/g, "");
@@ -1429,7 +1515,7 @@ bot.on("text", async (ctx) => {
         setChatState(chatId, { mode: "ask_kullanim_tarzi", leadId: lead.id });
         const reply = "Görselden okunamadı: Aracınızın kullanım tarzı nedir? (Örn: Hususi otomobil, kamyonet)";
         addMessage(chatId, "bot", reply);
-        await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply);
+        await sendToUser(chatId, reply);
         return;
       }
       lead.status = "awaiting_marka_km";
@@ -1438,7 +1524,7 @@ bot.on("text", async (ctx) => {
       const hasMarka = hasMarkaFromRuhsat(updated);
       const reply = hasMarka ? "Aracınızın yaklaşık km bilgisini lütfen yazar mısınız? (Örn: 45000 km) 🚗" : "Aracınızın markası ve yaklaşık km bilgisini lütfen yazar mısınız? (Örn: Toyota Corolla 45000 km) 🚗";
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply);
+      await sendToUser(chatId, reply);
       return;
     }
   }
@@ -1450,12 +1536,8 @@ bot.on("text", async (ctx) => {
       setChatState(chatId, null);
     } else if (!seriNo) {
       const reply = "Ruhsatın sağ alt köşesindeki belge numarası 2 harf + 6 rakam olmalı (örn: AA 123456). Tekrar yazar mısınız? 📄";
-      const rows = [
-        [Markup.button.callback("✍️ Belge No'yu tekrar yazayım", "manual_belge_" + lead.id)],
-        [Markup.button.callback("🏠 Ana Menü", "main_menu")],
-      ];
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+      await sendToUser(chatId, reply, [{ label: "✍️ Belge No'yu tekrar yazayım", action: "manual_belge_" + lead.id }, { label: "🏠 Ana Menü", action: "main_menu" }]);
       return;
     } else {
       const normalized = seriNo.replace(/\s/g, "");
@@ -1468,7 +1550,7 @@ bot.on("text", async (ctx) => {
         setChatState(chatId, { mode: "ask_kullanim_tarzi", leadId: lead.id });
         const reply = "Görselden okuyamadım. 😅 Aracınızın kullanım tarzını lütfen yazar mısınız? (Örn: Hususi otomobil, kamyonet, ticari taksi)";
         addMessage(chatId, "bot", reply);
-        await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply);
+        await sendToUser(chatId, reply);
         return;
       }
       lead.status = "awaiting_marka_km";
@@ -1477,7 +1559,7 @@ bot.on("text", async (ctx) => {
       const hasMarka = hasMarkaFromRuhsat(updated);
       const reply = hasMarka ? "Teşekkürler! 😊\n\nAracınızın yaklaşık km bilgisini lütfen yazar mısınız? (Örn: 45000 km) 🚗" : "Teşekkürler! 😊\n\nAracınızın markası ve yaklaşık km bilgisini lütfen yazar mısınız? (Örn: Toyota Corolla 45000 km) 🚗";
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply);
+      await sendToUser(chatId, reply);
       return;
     }
   }
@@ -1491,7 +1573,7 @@ bot.on("text", async (ctx) => {
       const step = getStepIndicator("ask_kullanim_tarzi");
       const reply = step + "Lütfen kullanım tarzını kısaca yazar mısınız? (Örn: Hususi, Ticari, Taksi) 😊";
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+      await sendToUser(chatId, reply, MAIN_MENU_CHOICE);
       return;
     } else {
       const ruhsatData = { ...(lead.ruhsatData || {}), kullanimTarzi: kullanim };
@@ -1505,7 +1587,7 @@ bot.on("text", async (ctx) => {
         ? "Harika! Tüm bilgileri aldım. 🏁 Son olarak aracınızın yaklaşık km bilgisini yazar mısınız? (Örn: 45000 km)"
         : "Harika! Tüm bilgileri aldım. 🏁 Son olarak aracınızın markası ve yaklaşık km bilgisini yazar mısınız? (Örn: Toyota Corolla 45000 km)";
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply);
+      await sendToUser(chatId, reply);
       return;
     }
   }
@@ -1530,7 +1612,7 @@ bot.on("text", async (ctx) => {
           const step = getStepIndicator("ask_marka_km");
           const reply = step + "Lütfen yaklaşık km bilgisini yazar mısınız? (Örn: 45000 veya 45000 km) 🚗";
           addMessage(chatId, "bot", reply);
-          await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+          await sendToUser(chatId, reply, MAIN_MENU_CHOICE);
           return;
         }
       } else {
@@ -1538,7 +1620,7 @@ bot.on("text", async (ctx) => {
           const step = getStepIndicator("ask_marka_km");
           const reply = step + "Lütfen marka ve km bilgisini kısaca yazar mısınız? (Örn: Honda Civic 62000 km) 🚗";
           addMessage(chatId, "bot", reply);
-          await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+          await sendToUser(chatId, reply, MAIN_MENU_CHOICE);
           return;
         }
       }
@@ -1551,7 +1633,7 @@ bot.on("text", async (ctx) => {
       const step = getStepIndicator("awaiting_package");
       const reply = step + "Bilgileriniz alındı. 😊 Hangi sigorta paketini tercih ediyorsunuz? Aşağıdaki butonlardan seçin.";
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, packageInlineKeyboard(true, lead.id));
+      await sendToUser(chatId, reply, packageChoices(true, lead.id));
       return;
     }
   }
@@ -1564,7 +1646,7 @@ bot.on("text", async (ctx) => {
     const step = getStepIndicator("ask_name");
     const reply = step + "Merhaba! 😊 Size daha iyi hizmet verebilmek için önce adınız ve soyadınızı alabilir miyim lütfen? (Örn: Ahmet Yılmaz)";
     addMessage(chatId, "bot", reply);
-    await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, Markup.inlineKeyboard([[Markup.button.callback("🏠 Ana Menü", "main_menu")]]));
+    await sendToUser(chatId, reply, MAIN_MENU_CHOICE);
     return;
   }
   if (["2", "2️⃣ hasar / yol yardım", "hasar", "kaza"].includes(menuChoice.toLowerCase())) {
@@ -1576,7 +1658,7 @@ bot.on("text", async (ctx) => {
       "📞 Acil çekici için: 0850 XXX XX XX\n\n" +
       "İsterseniz Canlı Destek ile temsilciye bağlanabilirsiniz. 😊";
     addMessage(chatId, "bot", reply);
-    await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, menuInlineKeyboard());
+    await sendToUser(chatId, reply, MENU_CHOICES);
     return;
   }
   if (["3", "3️⃣ poliçe sorgulama", "poliçe", "sorgulama"].includes(menuChoice.toLowerCase())) {
@@ -1584,7 +1666,7 @@ bot.on("text", async (ctx) => {
       "📄 Poliçe bilgi ve kapsam sorgulama özelliği yakında devreye alınacak.\n\n" +
       "Şimdilik teklif almak veya canlı destek için aşağıdaki menüyü kullanabilirsiniz. 😊";
     addMessage(chatId, "bot", reply);
-    await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, menuInlineKeyboard());
+    await sendToUser(chatId, reply, MENU_CHOICES);
     return;
   }
   if (["4", "4️⃣ belge talebi", "belge", "poliçe pdf"].includes(menuChoice.toLowerCase())) {
@@ -1592,7 +1674,7 @@ bot.on("text", async (ctx) => {
       "📑 Belge talebi (poliçe PDF, kartuş, makbuz) özelliği yakında eklenecek.\n\n" +
       "Canlı destekten belge talebinde bulunabilirsiniz. 😊";
     addMessage(chatId, "bot", reply);
-    await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, menuInlineKeyboard());
+    await sendToUser(chatId, reply, MENU_CHOICES);
     return;
   }
   if (["5", "5️⃣ canlı destek", "canlı destek", "temsilci"].includes(menuChoice.toLowerCase())) {
@@ -1600,37 +1682,24 @@ bot.on("text", async (ctx) => {
       "Hemen sizi bir temsilcimize yönlendiriyoruz. 💬 Bekleme süresi yaklaşık 2 dakika. Lütfen ayrılmayın.\n\n" +
       "Temsilcimiz en kısa sürede dönüş yapacaktır. 😊";
     addMessage(chatId, "bot", reply);
-    await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, menuInlineKeyboard());
+    await sendToUser(chatId, reply, MENU_CHOICES);
     return;
   }
 
   // Fallback: sadece butonlar, tekrarlı liste yok
   const reply = "Size nasıl yardımcı olabilirim? Aşağıdaki butonlardan seçin: 😊";
   addMessage(chatId, "bot", reply);
-  await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, menuInlineKeyboard());
-});
-
-/** includeDetay: true = ilk sefer (Detay butonu var), false = Detay tıklandıktan sonra (sadece paketler). leadId verilirse Beni Ara butonu eklenir. */
-function packageInlineKeyboard(includeDetay = true, leadId = null) {
-  const packages = getPackages();
-  const rows = packages.map((p) => [Markup.button.callback(p.name, p.key)]);
-  if (leadId) rows.push([Markup.button.callback("📞 Beni Ara", "pkg_ara")]);
-  if (includeDetay) rows.push([Markup.button.callback("Detay", "pkg_detay")]);
-  return Markup.inlineKeyboard(rows);
+  await sendToUser(chatId, reply, MENU_CHOICES);
 }
 
-async function sendPackageCompletion(ctx, chatId, lead, pkg) {
+async function sendPackageCompletion(chatId, lead, pkg) {
   const reply = "Tercihiniz kaydedildi. 😊 Teklifiniz hazırlanıyor; en kısa sürede size dönüş yapacağız.";
   addMessage(chatId, "bot", reply);
-        await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply);
+  await sendToUser(chatId, reply);
 }
 
-bot.on("photo", async (ctx) => {
-  const chatId = ctx.chat.id;
-  const photo = ctx.message.photo;
-  const largest = photo[photo.length - 1];
-  const fileId = largest.file_id;
-  const fileUniqueId = largest.file_unique_id || String(fileId);
+async function handlePhoto(chatId, savedPath, fileUniqueId) {
+  if (!savedPath) return;
 
   // Aynı fotoğraf tekrar gönderildiyse AI çağrısı yapma (maliyet tasarrufu)
   const cached = getCachedPhotoResult(chatId, fileUniqueId);
@@ -1651,28 +1720,11 @@ bot.on("photo", async (ctx) => {
       const summaryBlock = ruhsatSummary.length > 0 ? "\n\n📋 Okunan ruhsat bilgileri:\n" + ruhsatSummary.join("\n") : "";
       setChatState(chatId, { mode: "confirm_plate", leadId: lead.id, plateGuess: guessedPlate });
       const reply = "Bu fotoğrafı az önce işlemiştik. 😊 Mevcut teklifinize devam edebilirsiniz." + (guessedPlate ? summaryBlock + `\n\nPlaka: ${guessedPlate}\n\nPlaka doğru mu?` : summaryBlock + "\n\nPlakayı elle yazmak için aşağıdaki butonu kullanabilirsiniz.");
-      const kb = guessedPlate ? Markup.inlineKeyboard([[Markup.button.callback("✓ Evet, doğru", "confirm_plate_evet_" + lead.id)], [Markup.button.callback("✏️ Hayır, düzelt", "confirm_plate_hayir_" + lead.id)]]) : Markup.inlineKeyboard([[Markup.button.callback("✍️ Plakayı elle yazayım", "manual_plate_" + lead.id)], [Markup.button.callback("📸 Tekrar fotoğraf çek", "retry_upload_" + lead.id)]]);
+      const kb = guessedPlate ? confirmPlateChoices(lead) : [{ label: "✍️ Plakayı elle yazayım", action: "manual_plate_" + lead.id }, { label: "📸 Tekrar fotoğraf çek", action: "retry_upload_" + lead.id }, { label: "🏠 Ana Menü", action: "main_menu" }];
       addMessage(chatId, "bot", reply);
-      await sendAndTrackTelegram(ctx.telegram, chatId, reply, kb);
+      await sendToUser(chatId, reply, kb);
       return;
     }
-  }
-
-  let savedPath = null;
-  try {
-    const file = await ctx.telegram.getFile(fileId);
-    const filePath = file.file_path;
-    const ext = path.extname(filePath) || ".jpg";
-    const baseName = `${chatId}_${Date.now()}${ext}`;
-    savedPath = path.join(UPLOAD_DIR, baseName);
-
-    const url = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error("Download failed");
-    const buf = Buffer.from(await resp.arrayBuffer());
-    fs.writeFileSync(savedPath, buf);
-  } catch (err) {
-    console.error("Photo download error:", err.message);
   }
 
   addMessage(chatId, "user", "[Fotoğraf]", {
@@ -1703,9 +1755,8 @@ bot.on("photo", async (ctx) => {
   const aiOnPhoto = process.env.RUHSAT_AI_ON_PHOTO !== "false" && process.env.RUHSAT_AI_ON_PHOTO !== "0";
   if (savedPath && aiOnPhoto) {
     try {
-      const loadingMsg = await ctx.telegram.sendMessage(chatId, "Ruhsat fotoğrafınız inceleniyor, lütfen bekleyin... 🔍");
+      await sendToUser(chatId, "Ruhsat fotoğrafınız inceleniyor, lütfen bekleyin... 🔍");
       ruhsatData = await extractRuhsatFromImage(savedPath) || {};
-      try { await ctx.telegram.deleteMessage(chatId, loadingMsg.message_id); } catch (_) {}
       if (Object.keys(ruhsatData).length > 0) {
         updateLead(lead.id, { ruhsatData, ...syncLeadFieldsFromRuhsat(ruhsatData) });
         lead.ruhsatData = ruhsatData;
@@ -1738,12 +1789,9 @@ bot.on("photo", async (ctx) => {
     const reply =
       step + "Ruhsat fotoğrafınız alındı, teşekkürler! 📸" + summaryBlock + "\n\n" +
       `Görselden okunan plaka: ${guessedPlate}\n\nPlaka doğru mu?`;
-    const kb = Markup.inlineKeyboard([
-      [Markup.button.callback("✓ Evet, doğru", "confirm_plate_evet_" + lead.id)],
-      [Markup.button.callback("✏️ Hayır, düzelt", "confirm_plate_hayir_" + lead.id)],
-    ]);
+    const kb = confirmPlateChoices(lead);
     addMessage(chatId, "bot", reply);
-    await sendAndTrackTelegram(ctx.telegram, ctx.chat.id, reply, kb);
+    await sendToUser(chatId, reply, kb);
   } else {
     lead.status = "awaiting_plate";
     updateLead(lead.id, { status: "awaiting_plate" });
@@ -1752,14 +1800,10 @@ bot.on("photo", async (ctx) => {
     const reply = isNothingRead
       ? "Ruhsat fotoğrafınız alındı, teşekkürler! 📸 Görüntü biraz bulanık olabilir; bilgileri net okuyamadım. İsterseniz tekrar çekebilir veya elle girebilirsiniz. 😊"
       : "Ruhsat fotoğrafınız alındı, teşekkürler! 📸" + summaryBlock + "\n\nPlaka kısmını net okuyamadım. Lütfen plakanızı yazar mısınız? (Örn: 34ABC123)";
-    const rows = [
-      [Markup.button.callback("✍️ Plakayı elle yazayım", "manual_plate_" + lead.id)],
-      [Markup.button.callback("📸 Tekrar fotoğraf çek", "retry_upload_" + lead.id)],
-    ];
     addMessage(chatId, "bot", reply);
-    await sendAndTrackTelegram(ctx.telegram, chatId, reply, Markup.inlineKeyboard(rows));
+    await sendToUser(chatId, reply, tescilBelgeMenuChoices(lead));
   }
-});
+}
 
 let _stateTimeoutTickCount = 0;
 async function runStateTimeoutCheck() {
@@ -1797,7 +1841,7 @@ async function runStateTimeoutCheck() {
       delete chatStates[chatId];
       try {
         addMessage(chatId, "bot", iptalMesaj);
-        await sendAndTrackTelegram(bot.telegram, chatId, iptalMesaj, menuInlineKeyboard());
+        await sendToUser(chatId, iptalMesaj, MENU_CHOICES);
         console.log("[state-timeout] İptal:", chatId);
       } catch (e) { console.warn("[state-timeout] İptal mesaj:", e?.message); }
     } else if (elapsed >= timeoutMs - uyariMs && !warningSentAt) {
@@ -1806,19 +1850,18 @@ async function runStateTimeoutCheck() {
       const msg = uyariMesaj.replace(/\{dakika\}/g, String(dakikaGoster));
       try {
         addMessage(chatId, "bot", msg);
-        await sendAndTrackTelegram(bot.telegram, chatId, msg);
+        await sendToUser(chatId, msg);
         console.log("[state-timeout] Uyarı:", chatId);
       } catch (e) { console.warn("[state-timeout] Uyarı mesaj:", e?.message); }
     }
   }
 }
 
-bot.launch().then(async () => {
-   console.log("Telegram bot started.");
-   try { await runTelegramMessageCleanup(bot.telegram); } catch (e) { console.warn("[telegram] Başlangıç temizliği:", e?.message); }
- }).catch((err) => {
-   console.error("Telegram bot baslatilamadi (sunucu yine de calisiyor):", err.message);
- });
+if (process.env.WHATSAPP_ACCESS_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID) {
+  console.log("[WhatsApp] Cloud API kullanılıyor. Webhook: " + (process.env.BASE_URL || "http://localhost:" + PORT) + "/webhook/whatsapp");
+} else {
+  console.warn("[WhatsApp] WHATSAPP_ACCESS_TOKEN veya WHATSAPP_PHONE_NUMBER_ID eksik; mesaj gönderilemez.");
+}
 
  app.listen(PORT, "0.0.0.0", () => {
    console.log(`Server: http://localhost:${PORT}  ve  http://127.0.0.1:${PORT}`);

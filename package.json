@@ -1,7 +1,7 @@
 {
    "name": "insurance-admin-telegram-bot",
    "version": "1.0.0",
-   "description": "Admin panel and Telegram bot for testing insurance chatbot flows",
+   "description": "Admin panel and WhatsApp bot for insurance chatbot flows",
    "main": "index.js",
    "scripts": {
       "start": "node index.js",
@@ -9,7 +9,7 @@
       "build": "npm run build --prefix admin-app"
    },
    "keywords": [
-      "telegram",
+      "whatsapp",
       "bot",
       "admin",
       "insurance"
@@ -19,8 +19,7 @@
    "dependencies": {
       "better-sqlite3": "^12.6.2",
       "dotenv": "^17.3.1",
-      "express": "^5.2.1",
-      "telegraf": "^4.16.3"
+      "express": "^5.2.1"
    },
    "devDependencies": {
       "nodemon": "^3.1.14"
